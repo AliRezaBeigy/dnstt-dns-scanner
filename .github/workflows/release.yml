@@ -1,0 +1,113 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'  # Triggers on tags like v1.0.0, v1.2.3, etc.
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            asset_name: linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            asset_name: linux-arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            asset_name: windows-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            asset_name: darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            asset_name: darwin-arm64
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      ASSET_NAME: ${{ matrix.asset_name }}
+      EXE_EXT: ${{ matrix.goos == 'windows' && '.exe' || '' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binary
+        shell: bash
+        run: |
+          mkdir -p build_assets
+          cd dnstt-dns-scanner
+          go build -o ../build_assets/dnstt-dns-scanner-${{ env.ASSET_NAME }}${{ env.EXE_EXT }} -ldflags="-s -w" .
+          if [ "${{ matrix.goos }}" != "windows" ]; then chmod +x ../build_assets/dnstt-dns-scanner-${{ env.ASSET_NAME }}${{ env.EXE_EXT }}; fi
+
+      - name: Get tag name
+        id: get_tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # Extract tag from refs/tags/v1.0.0
+            TAG=${GITHUB_REF#refs/tags/}
+          elif [[ "${{ github.event_name }}" == "release" ]]; then
+            # Get tag from release event
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            # For workflow_dispatch, use latest tag or require manual input
+            TAG=${GITHUB_REF#refs/tags/}
+            if [[ -z "$TAG" ]]; then
+              echo "Error: No tag found. Please push a tag or create a release."
+              exit 1
+            fi
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Using tag: $TAG"
+
+      - name: Create Release (if pushing tag)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          name: Release ${{ steps.get_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload binary to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: build_assets/dnstt-dns-scanner-${{ env.ASSET_NAME }}${{ env.EXE_EXT }}
+          asset_name: dnstt-dns-scanner-${{ env.ASSET_NAME }}${{ env.EXE_EXT }}
+          tag: ${{ steps.get_tag.outputs.tag }}
+          overwrite: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnstt-dns-scanner-${{ env.ASSET_NAME }}
+          path: build_assets/dnstt-dns-scanner-${{ env.ASSET_NAME }}${{ env.EXE_EXT }}
+          retention-days: 7
