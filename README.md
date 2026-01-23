@@ -87,6 +87,7 @@ The `-ips` flag accepts:
 | `-output FILE` | Save results to file (includes summary and ready-to-use commands) | ❌ No |
 | `-test-domain DOMAIN` | Custom domain to query for DNS server test | ❌ No |
 | `-test-txt VALUE` | Expected TXT record value to verify DNS server works correctly | ❌ No |
+| `-quick` | Skip advanced tunnel tests (only perform basic connectivity test) | ❌ No |
 
 ### Examples
 
@@ -148,6 +149,14 @@ The `-ips` flag accepts:
                      -output scan_results.txt
 ```
 
+**Quick scan (basic connectivity only, faster):**
+```bash
+./dnstt-dns-scanner -ips 10.10.0.0/16 \
+                     -pubkey-file server.pub \
+                     t.example.com \
+                     -quick
+```
+
 ## How It Works
 
 The scanner performs a comprehensive three-stage test for each DNS server:
@@ -167,6 +176,17 @@ The scanner performs a comprehensive three-stage test for each DNS server:
    - Tests SOCKS5 proxy connectivity
    - Verifies HTTP traffic routing through tunnel
    - **Only servers passing this test receive the `TUNNEL` tag**
+
+### Test Modes
+
+**Full Mode (default):** Performs all tunnel tests including:
+- Basic connectivity test (single HTTP request)
+- Multiple concurrent streams test
+- Sustained data transfer test
+- Multiple streams stability test
+- **Bidirectional communication test** (8 request/response cycles to catch DNS resolvers that stop mid-connection)
+
+**Quick Mode (`-quick` flag):** Only performs the basic connectivity test. This is faster but may miss DNS resolvers that work initially but fail under sustained use (like SSH authentication failures). Use quick mode for initial scanning, then verify promising servers with full mode.
 
 ## Output
 

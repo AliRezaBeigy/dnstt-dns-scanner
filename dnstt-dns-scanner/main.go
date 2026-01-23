@@ -427,7 +427,7 @@ func (c *ScannerDNSPacketConn) Close() error {
 }
 
 // testDNSTTEncoding tests the full protocol stack: DNS -> KCP -> Noise -> smux -> SOCKS5.
-func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.Duration) (bool, bool, time.Duration, error) {
+func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, quick bool) (bool, bool, time.Duration, error) {
 	startTime := time.Now()
 
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip, "53"))
@@ -486,9 +486,54 @@ func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.D
 	}
 	defer sess.Close()
 
+	// Test 1: First HTTP request (basic connectivity)
+	err = testHTTPRequest(sess, timeout, "example.com", 1)
+	if err != nil {
+		return true, false, time.Since(startTime), fmt.Errorf("first HTTP request failed: %v", err)
+	}
+
+	if quick {
+		latency := time.Since(startTime)
+		return true, true, latency, nil
+	}
+
+	// Test 2: Open a second stream and make another request
+	// This tests if the DNS resolver handles multiple concurrent streams
+	err = testHTTPRequest(sess, timeout, "example.com", 2)
+	if err != nil {
+		return true, false, time.Since(startTime), fmt.Errorf("second HTTP request failed (DNS may rate-limit): %v", err)
+	}
+
+	// Test 3: Transfer more data to test sustained throughput
+	// Some DNS resolvers work for small amounts but fail under load
+	err = testDataTransfer(sess, timeout)
+	if err != nil {
+		return true, false, time.Since(startTime), fmt.Errorf("data transfer test failed (DNS may have throughput issues): %v", err)
+	}
+
+	// Test 4: Open multiple streams rapidly to test connection stability
+	err = testMultipleStreams(sess, timeout, 3)
+	if err != nil {
+		return true, false, time.Since(startTime), fmt.Errorf("multiple streams test failed (DNS may reset connections): %v", err)
+	}
+
+	// Test 5: Bidirectional communication test (like HTTP/2 or SSH)
+	// This tests if DNS resolver maintains connection for multiple send/receive cycles
+	// Catches resolvers that stop responding mid-connection
+	err = testBidirectionalCommunication(sess, timeout)
+	if err != nil {
+		return true, false, time.Since(startTime), fmt.Errorf("bidirectional communication test failed (DNS stops mid-connection): %v", err)
+	}
+
+	latency := time.Since(startTime)
+	return true, true, latency, nil
+}
+
+// testHTTPRequest opens a new stream and performs a complete HTTP request/response cycle
+func testHTTPRequest(sess *smux.Session, timeout time.Duration, host string, reqNum int) error {
 	stream, err := sess.OpenStream()
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("stream open failed (but smux session worked): %v", err)
+		return fmt.Errorf("stream open failed: %v", err)
 	}
 	defer stream.Close()
 
@@ -497,71 +542,329 @@ func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.D
 	socks5Handshake := []byte{0x05, 0x01, 0x00}
 	_, err = stream.Write(socks5Handshake)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("SOCKS5 handshake write failed: %v", err)
+		return fmt.Errorf("SOCKS5 handshake write failed: %v", err)
 	}
 
 	response := make([]byte, 2)
 	_, err = io.ReadFull(stream, response)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("SOCKS5 handshake read failed: %v", err)
+		return fmt.Errorf("SOCKS5 handshake read failed: %v", err)
 	}
 
 	if response[0] != 0x05 || response[1] != 0x00 {
-		return true, false, time.Since(startTime), fmt.Errorf("invalid SOCKS5 response: %02x %02x", response[0], response[1])
+		return fmt.Errorf("invalid SOCKS5 response: %02x %02x", response[0], response[1])
 	}
 
-	targetHost := "example.com"
 	targetPort := uint16(80)
 	var connectReq bytes.Buffer
 	connectReq.WriteByte(0x05)
 	connectReq.WriteByte(0x01)
 	connectReq.WriteByte(0x00)
 	connectReq.WriteByte(0x03)
-	connectReq.WriteByte(byte(len(targetHost)))
-	connectReq.WriteString(targetHost)
+	connectReq.WriteByte(byte(len(host)))
+	connectReq.WriteString(host)
 	connectReq.WriteByte(byte(targetPort >> 8))
 	connectReq.WriteByte(byte(targetPort & 0xff))
 
 	_, err = stream.Write(connectReq.Bytes())
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("SOCKS5 CONNECT write failed: %v", err)
+		return fmt.Errorf("SOCKS5 CONNECT write failed: %v", err)
 	}
 
 	connectResp := make([]byte, 10)
 	_, err = io.ReadFull(stream, connectResp)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("SOCKS5 CONNECT read failed: %v", err)
+		return fmt.Errorf("SOCKS5 CONNECT read failed: %v", err)
 	}
 
 	if connectResp[0] != 0x05 {
-		return true, false, time.Since(startTime), fmt.Errorf("SOCKS5 CONNECT: invalid version %02x", connectResp[0])
+		return fmt.Errorf("SOCKS5 CONNECT: invalid version %02x", connectResp[0])
 	}
 	if connectResp[1] != 0x00 {
-		return true, false, time.Since(startTime), fmt.Errorf("SOCKS5 CONNECT failed: reply code %02x", connectResp[1])
+		return fmt.Errorf("SOCKS5 CONNECT failed: reply code %02x", connectResp[1])
 	}
 
-	httpReq := "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+	httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host)
 	_, err = stream.Write([]byte(httpReq))
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("HTTP request write failed: %v", err)
+		return fmt.Errorf("HTTP request write failed: %v", err)
 	}
 
 	httpResp := make([]byte, 4096)
 	n, err := stream.Read(httpResp)
 	if err != nil && err != io.EOF {
-		return true, false, time.Since(startTime), fmt.Errorf("HTTP response read failed: %v", err)
+		return fmt.Errorf("HTTP response read failed: %v", err)
 	}
 
 	respStr := strings.ToLower(string(httpResp[:n]))
 	if !strings.Contains(respStr, "example domain") {
-		return true, false, time.Since(startTime), fmt.Errorf("HTTP response does not contain 'example domain' (got %d bytes)", n)
+		return fmt.Errorf("HTTP response does not contain 'example domain' (got %d bytes)", n)
 	}
 
-	latency := time.Since(startTime)
-	return true, true, latency, nil
+	return nil
 }
 
-func scanIP(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, testDomain dns.Name, expectedTXT string, results chan<- scanResult) {
+// testDataTransfer tests sustained data transfer by downloading more content
+// This catches DNS resolvers that work for small transfers but fail under load
+func testDataTransfer(sess *smux.Session, timeout time.Duration) error {
+	stream, err := sess.OpenStream()
+	if err != nil {
+		return fmt.Errorf("stream open failed: %v", err)
+	}
+	defer stream.Close()
+
+	stream.SetDeadline(time.Now().Add(timeout * 3))
+
+	// SOCKS5 handshake
+	socks5Handshake := []byte{0x05, 0x01, 0x00}
+	_, err = stream.Write(socks5Handshake)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 handshake write failed: %v", err)
+	}
+
+	response := make([]byte, 2)
+	_, err = io.ReadFull(stream, response)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 handshake read failed: %v", err)
+	}
+
+	if response[0] != 0x05 || response[1] != 0x00 {
+		return fmt.Errorf("invalid SOCKS5 response: %02x %02x", response[0], response[1])
+	}
+
+	host := "httpbin.org"
+	targetPort := uint16(80)
+	var connectReq bytes.Buffer
+	connectReq.WriteByte(0x05)
+	connectReq.WriteByte(0x01)
+	connectReq.WriteByte(0x00)
+	connectReq.WriteByte(0x03)
+	connectReq.WriteByte(byte(len(host)))
+	connectReq.WriteString(host)
+	connectReq.WriteByte(byte(targetPort >> 8))
+	connectReq.WriteByte(byte(targetPort & 0xff))
+
+	_, err = stream.Write(connectReq.Bytes())
+	if err != nil {
+		return fmt.Errorf("SOCKS5 CONNECT write failed: %v", err)
+	}
+
+	connectResp := make([]byte, 10)
+	_, err = io.ReadFull(stream, connectResp)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 CONNECT read failed: %v", err)
+	}
+
+	if connectResp[0] != 0x05 || connectResp[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 CONNECT failed: %02x %02x", connectResp[0], connectResp[1])
+	}
+
+	httpReq := "GET /bytes/2048 HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"
+	_, err = stream.Write([]byte(httpReq))
+	if err != nil {
+		return fmt.Errorf("HTTP request write failed: %v", err)
+	}
+
+	totalRead := 0
+	buf := make([]byte, 4096)
+	for {
+		n, err := stream.Read(buf)
+		totalRead += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("data transfer read failed after %d bytes: %v", totalRead, err)
+		}
+
+		if totalRead > 2500 {
+			break
+		}
+	}
+
+	if totalRead < 2000 {
+		return fmt.Errorf("insufficient data received: %d bytes (expected ~2KB)", totalRead)
+	}
+
+	return nil
+}
+
+// testMultipleStreams opens multiple streams rapidly to test connection stability
+// Some DNS resolvers reset connections when too many queries come in quick succession
+func testMultipleStreams(sess *smux.Session, timeout time.Duration, count int) error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, count)
+
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(streamNum int) {
+			defer wg.Done()
+			stream, err := sess.OpenStream()
+			if err != nil {
+				errChan <- fmt.Errorf("stream %d open failed: %v", streamNum, err)
+				return
+			}
+			defer stream.Close()
+
+			stream.SetDeadline(time.Now().Add(timeout))
+
+			// Just do SOCKS5 handshake to test stream stability
+			socks5Handshake := []byte{0x05, 0x01, 0x00}
+			_, err = stream.Write(socks5Handshake)
+			if err != nil {
+				errChan <- fmt.Errorf("stream %d write failed: %v", streamNum, err)
+				return
+			}
+
+			response := make([]byte, 2)
+			_, err = io.ReadFull(stream, response)
+			if err != nil {
+				errChan <- fmt.Errorf("stream %d read failed: %v", streamNum, err)
+				return
+			}
+
+			if response[0] != 0x05 || response[1] != 0x00 {
+				errChan <- fmt.Errorf("stream %d invalid SOCKS5: %02x %02x", streamNum, response[0], response[1])
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	var errors []string
+	for err := range errChan {
+		errors = append(errors, err.Error())
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("%d/%d streams failed: %s", len(errors), count, strings.Join(errors, "; "))
+	}
+
+	return nil
+}
+
+// testBidirectionalCommunication tests sustained bidirectional data flow on a single stream.
+// This simulates protocols like SSH where you send a packet, wait for response, send another.
+// Performs 8 request/response cycles on the same connection to catch DNS resolvers that:
+// - Stop sending responses after initial queries succeed
+// - Stop receiving data mid-connection (like SSH auth failures)
+// - Rate-limit or reset connections under sustained bidirectional traffic
+func testBidirectionalCommunication(sess *smux.Session, timeout time.Duration) error {
+	stream, err := sess.OpenStream()
+	if err != nil {
+		return fmt.Errorf("stream open failed: %v", err)
+	}
+	defer stream.Close()
+
+	stream.SetDeadline(time.Now().Add(timeout * 4))
+
+	socks5Handshake := []byte{0x05, 0x01, 0x00}
+	_, err = stream.Write(socks5Handshake)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 handshake write failed: %v", err)
+	}
+
+	response := make([]byte, 2)
+	_, err = io.ReadFull(stream, response)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 handshake read failed: %v", err)
+	}
+
+	if response[0] != 0x05 || response[1] != 0x00 {
+		return fmt.Errorf("invalid SOCKS5 response: %02x %02x", response[0], response[1])
+	}
+
+	host := "httpbin.org"
+	targetPort := uint16(80)
+	var connectReq bytes.Buffer
+	connectReq.WriteByte(0x05)
+	connectReq.WriteByte(0x01)
+	connectReq.WriteByte(0x00)
+	connectReq.WriteByte(0x03)
+	connectReq.WriteByte(byte(len(host)))
+	connectReq.WriteString(host)
+	connectReq.WriteByte(byte(targetPort >> 8))
+	connectReq.WriteByte(byte(targetPort & 0xff))
+
+	_, err = stream.Write(connectReq.Bytes())
+	if err != nil {
+		return fmt.Errorf("SOCKS5 CONNECT write failed: %v", err)
+	}
+
+	connectResp := make([]byte, 10)
+	_, err = io.ReadFull(stream, connectResp)
+	if err != nil {
+		return fmt.Errorf("SOCKS5 CONNECT read failed: %v", err)
+	}
+
+	if connectResp[0] != 0x05 || connectResp[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 CONNECT failed: %02x %02x", connectResp[0], connectResp[1])
+	}
+
+	const numCycles = 8
+	for i := 0; i < numCycles; i++ {
+		httpReq := fmt.Sprintf("GET /get?cycle=%d HTTP/1.1\r\nHost: httpbin.org\r\nConnection: keep-alive\r\n\r\n", i)
+		_, err = stream.Write([]byte(httpReq))
+		if err != nil {
+			return fmt.Errorf("cycle %d/%d: write failed (DNS stopped sending): %v", i+1, numCycles, err)
+		}
+
+		buf := make([]byte, 4096)
+		totalRead := 0
+		maxRead := 4096
+		deadline := time.Now().Add(10 * time.Second)
+
+		for totalRead < maxRead {
+			stream.SetReadDeadline(deadline)
+			n, err := stream.Read(buf[totalRead:])
+			if err != nil {
+				if err == io.EOF {
+					if totalRead == 0 {
+						return fmt.Errorf("cycle %d/%d: connection closed unexpectedly (DNS stopped receiving)", i+1, numCycles)
+					}
+					break
+				}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					return fmt.Errorf("cycle %d/%d: read timeout (DNS stopped responding mid-connection)", i+1, numCycles)
+				}
+				return fmt.Errorf("cycle %d/%d: read failed: %v", i+1, numCycles, err)
+			}
+			if n == 0 {
+				break
+			}
+			totalRead += n
+
+			respStr := string(buf[:totalRead])
+			if strings.Contains(respStr, "\r\n\r\n") {
+				headerEnd := strings.Index(respStr, "\r\n\r\n")
+				bodyStart := headerEnd + 4
+				bodyRead := totalRead - bodyStart
+				if bodyRead >= 100 || strings.Contains(respStr, "\"url\":") {
+					break
+				}
+			}
+		}
+
+		if totalRead < 100 {
+			return fmt.Errorf("cycle %d/%d: insufficient response (%d bytes) - DNS may have stopped mid-transfer", i+1, numCycles, totalRead)
+		}
+
+		respStr := strings.ToLower(string(buf[:totalRead]))
+		if !strings.Contains(respStr, "http/1.1") && !strings.Contains(respStr, "http/1.0") {
+			return fmt.Errorf("cycle %d/%d: invalid HTTP response - DNS may be corrupting data", i+1, numCycles)
+		}
+
+		if i < numCycles-1 {
+			time.Sleep(150 * time.Millisecond)
+		}
+	}
+
+	return nil
+}
+
+func scanIP(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, testDomain dns.Name, expectedTXT string, quick bool, results chan<- scanResult) {
 	working, hasEDNS, latency, err := testDNSServer(ip, domain, timeout, testDomain, expectedTXT)
 	result := scanResult{
 		ip:      ip,
@@ -576,7 +879,7 @@ func scanIP(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, te
 	}
 
 	if working {
-		dnsttWorking, hasTunnelResp, dnsttLatency, dnsttErr := testDNSTTEncoding(ip, domain, pubkey, timeout)
+		dnsttWorking, hasTunnelResp, dnsttLatency, dnsttErr := testDNSTTEncoding(ip, domain, pubkey, timeout, quick)
 		result.dnsttCompatible = dnsttWorking
 		result.hasTunnelResponse = hasTunnelResp
 		if !dnsttWorking {
@@ -707,10 +1010,11 @@ func main() {
 	var verbose bool
 	var testDomainStr string
 	var expectedTXT string
+	var quick bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s -ips IP_OR_CIDR_OR_FILE (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN [-threads N] [-timeout DURATION] [-verbose] [-output FILE]
+  %[1]s -ips IP_OR_CIDR_OR_FILE (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN [-threads N] [-timeout DURATION] [-verbose] [-output FILE] [-quick]
 
 The -ips flag accepts:
   - CIDR notation (e.g., 192.168.1.0/24)
@@ -722,6 +1026,7 @@ Examples:
   %[1]s -ips 192.168.1.1 -pubkey-file server.pub t.example.com
   %[1]s -ips ip-list.txt -pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff t.example.com -output results.txt
   %[1]s -ips 10.10.0.0/24 -pubkey-file server.pub t.example.com -test-domain test.k.markop.ir -test-txt "TEST RESULT"
+  %[1]s -ips 10.10.0.0/16 -pubkey-file server.pub t.example.com -quick
 
 Options:
 `, os.Args[0])
@@ -738,6 +1043,7 @@ Options:
 	flag.StringVar(&outputFile, "output", "", "save results to file (default: stdout only)")
 	flag.StringVar(&testDomainStr, "test-domain", "", "custom domain to query for DNS server test (e.g., test.k.markop.ir)")
 	flag.StringVar(&expectedTXT, "test-txt", "", "expected TXT record value to verify DNS server works correctly")
+	flag.BoolVar(&quick, "quick", false, "skip advanced tunnel tests (only perform basic connectivity test)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -808,6 +1114,11 @@ Options:
 	totalIPs := len(ips)
 	fmt.Fprintf(os.Stderr, "Scanning %d IPs from %s with %d threads (timeout: %v)...\n", totalIPs, ipsInput, threads, timeout)
 	fmt.Fprintf(os.Stderr, "Domain: %s\n", flag.Arg(0))
+	if quick {
+		fmt.Fprintf(os.Stderr, "Mode: Quick (basic connectivity test only)\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Mode: Full (all tunnel tests including bidirectional communication)\n")
+	}
 	if testDomainStr != "" {
 		fmt.Fprintf(os.Stderr, "Test domain: %s\n", testDomainStr)
 		if expectedTXT != "" {
@@ -841,7 +1152,7 @@ Options:
 					if !ok {
 						return
 					}
-					scanIP(ip, domain, pubkey, timeout, testDomain, expectedTXT, results)
+					scanIP(ip, domain, pubkey, timeout, testDomain, expectedTXT, quick, results)
 				}
 			}
 		}()
