@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,15 @@ const (
 // base32Encoding is a base32 encoding without padding (matches dnstt-client)
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
+type testLatencies struct {
+	dns           time.Duration
+	basicHTTP     time.Duration
+	secondStream  time.Duration
+	dataTransfer  time.Duration
+	multiStream   time.Duration
+	bidirectional time.Duration
+}
+
 type scanResult struct {
 	ip                string
 	working           bool
@@ -47,6 +57,7 @@ type scanResult struct {
 	hasTunnelResponse bool // True if we got a TXT response from tunnel server
 	errorMsg          string
 	latency           time.Duration
+	testLatencies     testLatencies
 }
 
 // readKeyFromFile reads a key from a named file.
@@ -63,7 +74,7 @@ func readKeyFromFile(filename string) ([]byte, error) {
 // If testDomain is provided, it queries that domain directly instead of creating a subdomain.
 // If expectedTXT is provided, it verifies the TXT response matches.
 // Returns: working, hasEDNS, latency, error
-func testDNSServer(ip string, domain dns.Name, timeout time.Duration, testDomain dns.Name, expectedTXT string) (bool, bool, time.Duration, error) {
+func testDNSServer(ctx context.Context, ip string, domain dns.Name, timeout time.Duration, testDomain dns.Name, expectedTXT string) (bool, bool, time.Duration, error) {
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip, "53"))
 	if err != nil {
 		return false, false, 0, err
@@ -73,7 +84,18 @@ func testDNSServer(ip string, domain dns.Name, timeout time.Duration, testDomain
 	if err != nil {
 		return false, false, 0, err
 	}
-	defer conn.Close()
+	connClosed := make(chan struct{})
+	defer func() {
+		conn.Close()
+		close(connClosed)
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.SetDeadline(time.Now())
+		case <-connClosed:
+		}
+	}()
 
 	conn.SetDeadline(time.Now().Add(timeout))
 
@@ -427,31 +449,43 @@ func (c *ScannerDNSPacketConn) Close() error {
 }
 
 // testDNSTTEncoding tests the full protocol stack: DNS -> KCP -> Noise -> smux -> SOCKS5.
-func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, quick bool) (bool, bool, time.Duration, error) {
+func testDNSTTEncoding(ctx context.Context, ip string, domain dns.Name, pubkey []byte, timeout time.Duration, quick bool) (bool, bool, time.Duration, testLatencies, error) {
 	startTime := time.Now()
+	var lat testLatencies
 
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip, "53"))
 	if err != nil {
-		return false, false, 0, err
+		return false, false, 0, lat, err
 	}
 
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		return false, false, 0, err
+		return false, false, 0, lat, err
 	}
-	defer conn.Close()
+	connClosed := make(chan struct{})
+	defer func() {
+		conn.Close()
+		close(connClosed)
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.SetDeadline(time.Now())
+		case <-connClosed:
+		}
+	}()
 
 	pconn := NewScannerDNSPacketConn(conn, domain, timeout)
 	defer pconn.Close()
 
 	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1
 	if mtu < 80 {
-		return false, false, time.Since(startTime), fmt.Errorf("domain too long, MTU=%d", mtu)
+		return false, false, time.Since(startTime), lat, fmt.Errorf("domain too long, MTU=%d", mtu)
 	}
 
 	kcpConn, err := kcp.NewConn2(pconn.remoteAddr, nil, 0, 0, pconn)
 	if err != nil {
-		return false, false, time.Since(startTime), fmt.Errorf("KCP setup failed: %v", err)
+		return false, false, time.Since(startTime), lat, fmt.Errorf("KCP setup failed: %v", err)
 	}
 	defer kcpConn.Close()
 
@@ -459,19 +493,19 @@ func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.D
 	kcpConn.SetNoDelay(0, 0, 0, 1)
 	kcpConn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 	if !kcpConn.SetMtu(mtu) {
-		return false, false, time.Since(startTime), fmt.Errorf("failed to set MTU")
+		return false, false, time.Since(startTime), lat, fmt.Errorf("failed to set MTU")
 	}
 
 	kcpConn.SetDeadline(time.Now().Add(timeout * 3))
 
 	noiseConn, err := noise.NewClient(kcpConn, pubkey)
 	if err != nil {
-		latency := time.Since(startTime)
+		elapsed := time.Since(startTime)
 		// Check if it's a timeout - that means DNS worked but no tunnel server
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return true, false, latency, fmt.Errorf("noise handshake timeout (DNS works, tunnel server not responding)")
+			return true, false, elapsed, lat, fmt.Errorf("noise handshake timeout (DNS works, tunnel server not responding)")
 		}
-		return false, false, latency, fmt.Errorf("noise handshake failed: %v", err)
+		return false, false, elapsed, lat, fmt.Errorf("noise handshake failed: %v", err)
 	}
 	defer noiseConn.Close()
 
@@ -482,51 +516,59 @@ func testDNSTTEncoding(ip string, domain dns.Name, pubkey []byte, timeout time.D
 
 	sess, err := smux.Client(noiseConn, smuxConfig)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("smux setup failed (but Noise worked): %v", err)
+		return true, false, time.Since(startTime), lat, fmt.Errorf("smux setup failed (but Noise worked): %v", err)
 	}
 	defer sess.Close()
 
 	// Test 1: First HTTP request (basic connectivity)
+	t1 := time.Now()
 	err = testHTTPRequest(sess, timeout, "example.com", 1)
+	lat.basicHTTP = time.Since(t1)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("first HTTP request failed: %v", err)
+		return true, false, time.Since(startTime), lat, fmt.Errorf("first HTTP request failed: %v", err)
 	}
 
 	if quick {
-		latency := time.Since(startTime)
-		return true, true, latency, nil
+		return true, true, time.Since(startTime), lat, nil
 	}
 
 	// Test 2: Open a second stream and make another request
 	// This tests if the DNS resolver handles multiple concurrent streams
+	t2 := time.Now()
 	err = testHTTPRequest(sess, timeout, "example.com", 2)
+	lat.secondStream = time.Since(t2)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("second HTTP request failed (DNS may rate-limit): %v", err)
+		return true, false, time.Since(startTime), lat, fmt.Errorf("second HTTP request failed (DNS may rate-limit): %v", err)
 	}
 
 	// Test 3: Transfer more data to test sustained throughput
 	// Some DNS resolvers work for small amounts but fail under load
+	t3 := time.Now()
 	err = testDataTransfer(sess, timeout)
+	lat.dataTransfer = time.Since(t3)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("data transfer test failed (DNS may have throughput issues): %v", err)
+		return true, false, time.Since(startTime), lat, fmt.Errorf("data transfer test failed (DNS may have throughput issues): %v", err)
 	}
 
 	// Test 4: Open multiple streams rapidly to test connection stability
+	t4 := time.Now()
 	err = testMultipleStreams(sess, timeout, 3)
+	lat.multiStream = time.Since(t4)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("multiple streams test failed (DNS may reset connections): %v", err)
+		return true, false, time.Since(startTime), lat, fmt.Errorf("multiple streams test failed (DNS may reset connections): %v", err)
 	}
 
 	// Test 5: Bidirectional communication test (like HTTP/2 or SSH)
 	// This tests if DNS resolver maintains connection for multiple send/receive cycles
 	// Catches resolvers that stop responding mid-connection
+	t5 := time.Now()
 	err = testBidirectionalCommunication(sess, timeout)
+	lat.bidirectional = time.Since(t5)
 	if err != nil {
-		return true, false, time.Since(startTime), fmt.Errorf("bidirectional communication test failed (DNS stops mid-connection): %v", err)
+		return true, false, time.Since(startTime), lat, fmt.Errorf("bidirectional communication test failed (DNS stops mid-connection): %v", err)
 	}
 
-	latency := time.Since(startTime)
-	return true, true, latency, nil
+	return true, true, time.Since(startTime), lat, nil
 }
 
 // testHTTPRequest opens a new stream and performs a complete HTTP request/response cycle
@@ -864,8 +906,11 @@ func testBidirectionalCommunication(sess *smux.Session, timeout time.Duration) e
 	return nil
 }
 
-func scanIP(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, testDomain dns.Name, expectedTXT string, quick bool, results chan<- scanResult) {
-	working, hasEDNS, latency, err := testDNSServer(ip, domain, timeout, testDomain, expectedTXT)
+func scanIP(ctx context.Context, ip string, domain dns.Name, pubkey []byte, timeout time.Duration, testDomain dns.Name, expectedTXT string, quick bool, results chan<- scanResult) {
+	if ctx.Err() != nil {
+		return
+	}
+	working, hasEDNS, latency, err := testDNSServer(ctx, ip, domain, timeout, testDomain, expectedTXT)
 	result := scanResult{
 		ip:      ip,
 		working: working,
@@ -879,7 +924,10 @@ func scanIP(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, te
 	}
 
 	if working {
-		dnsttWorking, hasTunnelResp, dnsttLatency, dnsttErr := testDNSTTEncoding(ip, domain, pubkey, timeout, quick)
+		if ctx.Err() != nil {
+			return
+		}
+		dnsttWorking, hasTunnelResp, dnsttLatency, dnsttLat, dnsttErr := testDNSTTEncoding(ctx, ip, domain, pubkey, timeout, quick)
 		result.dnsttCompatible = dnsttWorking
 		result.hasTunnelResponse = hasTunnelResp
 		if !dnsttWorking {
@@ -890,6 +938,7 @@ func scanIP(ip string, domain dns.Name, pubkey []byte, timeout time.Duration, te
 			}
 		} else {
 			result.latency = dnsttLatency
+			result.testLatencies = dnsttLat
 		}
 	}
 
@@ -1011,10 +1060,11 @@ func main() {
 	var testDomainStr string
 	var expectedTXT string
 	var quick bool
+	var tunnelOnly bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s -ips IP_OR_CIDR_OR_FILE (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN [-threads N] [-timeout DURATION] [-verbose] [-output FILE] [-quick]
+  %[1]s -ips IP_OR_CIDR_OR_FILE (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN [-threads N] [-timeout DURATION] [-verbose] [-output FILE] [-quick] [-tunnel-only]
 
 The -ips flag accepts:
   - CIDR notation (e.g., 192.168.1.0/24)
@@ -1044,6 +1094,7 @@ Options:
 	flag.StringVar(&testDomainStr, "test-domain", "", "custom domain to query for DNS server test (e.g., test.k.markop.ir)")
 	flag.StringVar(&expectedTXT, "test-txt", "", "expected TXT record value to verify DNS server works correctly")
 	flag.BoolVar(&quick, "quick", false, "skip advanced tunnel tests (only perform basic connectivity test)")
+	flag.BoolVar(&tunnelOnly, "tunnel-only", false, "show only DNS servers with full tunnel support in live output")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -1152,7 +1203,7 @@ Options:
 					if !ok {
 						return
 					}
-					scanIP(ip, domain, pubkey, timeout, testDomain, expectedTXT, quick, results)
+					scanIP(ctx, ip, domain, pubkey, timeout, testDomain, expectedTXT, quick, results)
 				}
 			}
 		}()
@@ -1160,6 +1211,7 @@ Options:
 
 	var scanned int64
 	var workingCount int64
+	var tunnelCount int64
 
 	var resultWg sync.WaitGroup
 	resultWg.Add(1)
@@ -1176,21 +1228,27 @@ Options:
 			if result.working {
 				atomic.AddInt64(&workingCount, 1)
 				workingServers = append(workingServers, result)
-				statusTags := []string{}
-				if result.hasEDNS {
-					statusTags = append(statusTags, "EDNS")
-				}
-				if result.dnsttCompatible {
-					statusTags = append(statusTags, "DNSTT")
-				}
 				if result.hasTunnelResponse {
-					statusTags = append(statusTags, "TUNNEL")
+					atomic.AddInt64(&tunnelCount, 1)
 				}
-				statusStr := ""
-				if len(statusTags) > 0 {
-					statusStr = " [" + strings.Join(statusTags, ",") + "]"
+				shouldPrint := !tunnelOnly || result.hasTunnelResponse
+				if shouldPrint {
+					statusTags := []string{}
+					if result.hasEDNS {
+						statusTags = append(statusTags, "EDNS")
+					}
+					if result.dnsttCompatible {
+						statusTags = append(statusTags, "DNSTT")
+					}
+					if result.hasTunnelResponse {
+						statusTags = append(statusTags, "TUNNEL")
+					}
+					statusStr := ""
+					if len(statusTags) > 0 {
+						statusStr = " [" + strings.Join(statusTags, ",") + "]"
+					}
+					fmt.Printf("✓ %s (latency: %v)%s\n", result.ip, result.latency, statusStr)
 				}
-				fmt.Printf("✓ %s (latency: %v)%s\n", result.ip, result.latency, statusStr)
 			} else if verbose {
 				fmt.Fprintf(os.Stderr, "✗ %s: %s\n", result.ip, result.errorMsg)
 			}
@@ -1201,9 +1259,15 @@ Options:
 				progressInterval = 1000
 			}
 			if progressInterval > 0 && current%int64(progressInterval) == 0 {
-				fmt.Fprintf(os.Stderr, "Progress: %d/%d (%.1f%%) - Found: %d\n",
-					current, totalIPs, float64(current)*100/float64(totalIPs),
-					atomic.LoadInt64(&workingCount))
+				if tunnelOnly {
+					fmt.Fprintf(os.Stderr, "Progress: %d/%d (%.1f%%) - Tunnel servers: %d\n",
+						current, totalIPs, float64(current)*100/float64(totalIPs),
+						atomic.LoadInt64(&tunnelCount))
+				} else {
+					fmt.Fprintf(os.Stderr, "Progress: %d/%d (%.1f%%) - Found: %d\n",
+						current, totalIPs, float64(current)*100/float64(totalIPs),
+						atomic.LoadInt64(&workingCount))
+				}
 			}
 		}
 	}()
@@ -1276,60 +1340,72 @@ Options:
 		fmt.Fprintf(&output, "# With EDNS(0) support: %d\n", outputEdnsCount)
 		fmt.Fprintf(&output, "# With DNSTT encoding support: %d\n", outputDnsttCount)
 		fmt.Fprintf(&output, "# With tunnel server response: %d\n", outputTunnelRespCount)
+		if tunnelOnly {
+			fmt.Fprintf(&output, "# Filter: tunnel-only\n")
+		}
 	}
 	output.WriteString("\n")
 
-	if len(workingServers) > 0 {
-		output.WriteString("# Working DNS servers (use with -udp option):\n\n")
-		for _, result := range workingServers {
-			warnings := []string{}
-			if !result.hasTunnelResponse {
-				warnings = append(warnings, "No tunnel")
+	serversToWrite := make([]scanResult, len(workingServers))
+	copy(serversToWrite, workingServers)
+	if tunnelOnly {
+		filtered := []scanResult{}
+		for _, r := range serversToWrite {
+			if r.hasTunnelResponse {
+				filtered = append(filtered, r)
 			}
-			if !result.hasEDNS {
-				warnings = append(warnings, "No EDNS support")
-			}
-			if !result.dnsttCompatible {
-				warnings = append(warnings, "DNSTT encoding test failed")
-			}
-			warningNote := ""
-			if len(warnings) > 0 {
-				warningNote = "  # Warning: " + strings.Join(warnings, ", ")
-			}
-			fmt.Fprintf(&output, "./dnstt-client -udp %s:53 -pubkey-file server.pub %s 127.0.0.1:7000%s\n",
-				result.ip, flag.Arg(0), warningNote)
 		}
-		output.WriteString("\n")
-		output.WriteString("# IP addresses only (one per line):\n")
-		for _, result := range workingServers {
+		serversToWrite = filtered
+	}
+	sort.Slice(serversToWrite, func(i, j int) bool {
+		return serversToWrite[i].latency < serversToWrite[j].latency
+	})
+
+	if len(serversToWrite) > 0 {
+		for _, result := range serversToWrite {
 			fmt.Fprintf(&output, "%s\n", result.ip)
 		}
 	} else {
-		fmt.Fprintf(&output, "# No working DNS servers found\n")
+		fmt.Fprintf(&output, "# No matching DNS servers found\n")
 	}
 
-	if len(workingServers) > 0 {
-		fmt.Println("Working DNS servers (use with -udp option):")
-		for _, result := range workingServers {
-			warnings := []string{}
-			if !result.hasTunnelResponse {
-				warnings = append(warnings, "No tunnel")
+	if tunnelRespCount > 0 {
+		// Collect and sort tunnel servers by latency
+		tunnelServers := []scanResult{}
+		for _, r := range workingServers {
+			if r.hasTunnelResponse {
+				tunnelServers = append(tunnelServers, r)
 			}
-			if !result.hasEDNS {
-				warnings = append(warnings, "No EDNS support")
+		}
+		sort.Slice(tunnelServers, func(i, j int) bool {
+			return tunnelServers[i].latency < tunnelServers[j].latency
+		})
+
+		fmt.Println("\nTunnel-capable DNS servers:")
+		for _, r := range tunnelServers {
+			lat := r.testLatencies
+			if lat.secondStream == 0 {
+				// quick mode: only the basic HTTP test ran
+				fmt.Printf("  %s (latency: %v) [basic: %v]\n",
+					r.ip, r.latency.Round(time.Millisecond),
+					lat.basicHTTP.Round(time.Millisecond))
+			} else {
+				fmt.Printf("  %s (latency: %v) [basic: %v, stream2: %v, transfer: %v, multi: %v, bidir: %v]\n",
+					r.ip, r.latency.Round(time.Millisecond),
+					lat.basicHTTP.Round(time.Millisecond),
+					lat.secondStream.Round(time.Millisecond),
+					lat.dataTransfer.Round(time.Millisecond),
+					lat.multiStream.Round(time.Millisecond),
+					lat.bidirectional.Round(time.Millisecond))
 			}
-			if !result.dnsttCompatible {
-				warnings = append(warnings, "DNSTT encoding test failed")
-			}
-			warningNote := ""
-			if len(warnings) > 0 {
-				warningNote = "  # Warning: " + strings.Join(warnings, ", ")
-			}
-			fmt.Printf("  ./dnstt-client -udp %s:53 -pubkey-file server.pub %s 127.0.0.1:7000%s\n",
-				result.ip, flag.Arg(0), warningNote)
+		}
+		fmt.Println("---")
+		fmt.Println("Tunnel-capable DNS servers IPs:")
+		for _, r := range tunnelServers {
+			fmt.Println(r.ip)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "No working DNS servers found\n")
+		fmt.Fprintf(os.Stderr, "No tunnel-capable DNS servers found\n")
 	}
 
 	if outputFile != "" {

@@ -6,16 +6,6 @@
 
 A powerful tool to scan IP address ranges and discover DNS servers that can be used with [`dnstt-client`](https://github.com/Mygod/dnstt). This scanner helps you find working DNS resolvers that support the dnstt (DNS tunnel) protocol, including full SOCKS proxy functionality.
 
-## Features
-
-- 🔍 **Comprehensive DNS Testing** - Tests basic DNS functionality, EDNS(0) support, and dnstt encoding compatibility
-- 🚀 **Full Tunnel Verification** - Verifies complete tunnel connectivity including SOCKS5 proxy support (as deployed by [dnstt-deploy](https://github.com/bugfloyd/dnstt-deploy))
-- ⚡ **High Performance** - Multi-threaded scanning with configurable concurrency
-- 📊 **Detailed Reporting** - Shows latency, capabilities, and provides ready-to-use commands
-- 💾 **Export Results** - Save scan results to file with metadata and commands
-- 🎯 **CIDR Support** - Scan entire network ranges efficiently
-- 🔄 **Graceful Interruption** - Press Ctrl+C to stop and see partial results
-
 ## Table of Contents
 
 - [Requirements](#requirements)
@@ -201,6 +191,17 @@ Each discovered DNS server shows status tags indicating its capabilities:
 - Route traffic through the SOCKS5 proxy interface (typically `127.0.0.1:1080`)
 
 **Only servers with the `TUNNEL` tag are fully functional for dnstt tunneling with SOCKS proxy support.** Servers without `TUNNEL` can respond to DNS queries but cannot complete the tunnel connection to your dnstt server or route traffic through SOCKS.
+
+
+## Features
+
+- 🔍 **Comprehensive DNS Testing** - Tests basic DNS functionality, EDNS(0) support, and dnstt encoding compatibility
+- 🚀 **Full Tunnel Verification** - Verifies complete tunnel connectivity including SOCKS5 proxy support (as deployed by [dnstt-deploy](https://github.com/bugfloyd/dnstt-deploy))
+- ⚡ **High Performance** - Multi-threaded scanning with configurable concurrency
+- 📊 **Detailed Reporting** - Shows latency, capabilities, and provides ready-to-use commands
+- 💾 **Export Results** - Save scan results to file with metadata and commands
+- 🎯 **CIDR Support** - Scan entire network ranges efficiently
+- 🔄 **Graceful Interruption** - Press Ctrl+C to stop and see partial results
 
 
 ## Building

@@ -85,12 +85,27 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Using tag: $TAG"
 
+      - name: Extract changelog for this version
+        id: changelog
+        shell: bash
+        run: |
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+          # Extract the section for this version from CHANGELOG.md
+          BODY=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          # Strip leading/trailing blank lines
+          BODY=$(echo "$BODY" | sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba}')
+          # Write to file to preserve multi-line content
+          echo "$BODY" > release_notes.md
+          echo "Release notes extracted for $VERSION"
+
       - name: Create Release (if pushing tag)
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.get_tag.outputs.tag }}
           name: Release ${{ steps.get_tag.outputs.tag }}
+          body_path: release_notes.md
           draft: false
           prerelease: false
         env:
