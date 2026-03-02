@@ -1315,62 +1315,9 @@ Options:
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 
-	var output strings.Builder
-	fmt.Fprintf(&output, "# DNS Scanner Results\n")
-	fmt.Fprintf(&output, "# Scan Date: %s\n", time.Now().Format(time.RFC3339))
-	fmt.Fprintf(&output, "# Input: %s\n", ipsInput)
-	fmt.Fprintf(&output, "# Domain: %s\n", flag.Arg(0))
-	fmt.Fprintf(&output, "# Total IPs scanned: %d/%d\n", finalScanned, totalIPs)
-	fmt.Fprintf(&output, "# Working DNS servers: %d\n", len(workingServers))
-	if len(workingServers) > 0 {
-		outputEdnsCount := 0
-		outputDnsttCount := 0
-		outputTunnelRespCount := 0
-		for _, r := range workingServers {
-			if r.hasEDNS {
-				outputEdnsCount++
-			}
-			if r.dnsttCompatible {
-				outputDnsttCount++
-			}
-			if r.hasTunnelResponse {
-				outputTunnelRespCount++
-			}
-		}
-		fmt.Fprintf(&output, "# With EDNS(0) support: %d\n", outputEdnsCount)
-		fmt.Fprintf(&output, "# With DNSTT encoding support: %d\n", outputDnsttCount)
-		fmt.Fprintf(&output, "# With tunnel server response: %d\n", outputTunnelRespCount)
-		if tunnelOnly {
-			fmt.Fprintf(&output, "# Filter: tunnel-only\n")
-		}
-	}
-	output.WriteString("\n")
-
-	serversToWrite := make([]scanResult, len(workingServers))
-	copy(serversToWrite, workingServers)
-	if tunnelOnly {
-		filtered := []scanResult{}
-		for _, r := range serversToWrite {
-			if r.hasTunnelResponse {
-				filtered = append(filtered, r)
-			}
-		}
-		serversToWrite = filtered
-	}
-	sort.Slice(serversToWrite, func(i, j int) bool {
-		return serversToWrite[i].latency < serversToWrite[j].latency
-	})
-
-	if len(serversToWrite) > 0 {
-		for _, result := range serversToWrite {
-			fmt.Fprintf(&output, "%s\n", result.ip)
-		}
-	} else {
-		fmt.Fprintf(&output, "# No matching DNS servers found\n")
-	}
-
+	// Build tunnel-only output (stdout and file share this; file follows stdout)
+	var tunnelOutput strings.Builder
 	if tunnelRespCount > 0 {
-		// Collect and sort tunnel servers by latency
 		tunnelServers := []scanResult{}
 		for _, r := range workingServers {
 			if r.hasTunnelResponse {
@@ -1381,16 +1328,15 @@ Options:
 			return tunnelServers[i].latency < tunnelServers[j].latency
 		})
 
-		fmt.Println("\nTunnel-capable DNS servers:")
+		fmt.Fprintf(&tunnelOutput, "\nTunnel-capable DNS servers:\n")
 		for _, r := range tunnelServers {
 			lat := r.testLatencies
 			if lat.secondStream == 0 {
-				// quick mode: only the basic HTTP test ran
-				fmt.Printf("  %s (latency: %v) [basic: %v]\n",
+				fmt.Fprintf(&tunnelOutput, "  %s (latency: %v) [basic: %v]\n",
 					r.ip, r.latency.Round(time.Millisecond),
 					lat.basicHTTP.Round(time.Millisecond))
 			} else {
-				fmt.Printf("  %s (latency: %v) [basic: %v, stream2: %v, transfer: %v, multi: %v, bidir: %v]\n",
+				fmt.Fprintf(&tunnelOutput, "  %s (latency: %v) [basic: %v, stream2: %v, transfer: %v, multi: %v, bidir: %v]\n",
 					r.ip, r.latency.Round(time.Millisecond),
 					lat.basicHTTP.Round(time.Millisecond),
 					lat.secondStream.Round(time.Millisecond),
@@ -1399,21 +1345,30 @@ Options:
 					lat.bidirectional.Round(time.Millisecond))
 			}
 		}
-		fmt.Println("---")
-		fmt.Println("Tunnel-capable DNS servers IPs:")
+		fmt.Fprintf(&tunnelOutput, "---\n")
+		fmt.Fprintf(&tunnelOutput, "Tunnel-capable DNS servers IPs:\n")
 		for _, r := range tunnelServers {
-			fmt.Println(r.ip)
+			fmt.Fprintf(&tunnelOutput, "%s\n", r.ip)
+		}
+
+		stdoutText := tunnelOutput.String()
+		fmt.Print(stdoutText)
+		if outputFile != "" {
+			if err := os.WriteFile(outputFile, []byte(stdoutText), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to write results to %s: %v\n", outputFile, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Results saved to: %s\n", outputFile)
+			}
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "No tunnel-capable DNS servers found\n")
-	}
-
-	if outputFile != "" {
-		err := os.WriteFile(outputFile, []byte(output.String()), 0644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to write results to %s: %v\n", outputFile, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Results saved to: %s\n", outputFile)
+		if outputFile != "" {
+			msg := "No tunnel-capable DNS servers found\n"
+			if err := os.WriteFile(outputFile, []byte(msg), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to write results to %s: %v\n", outputFile, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Results saved to: %s\n", outputFile)
+			}
 		}
 	}
 

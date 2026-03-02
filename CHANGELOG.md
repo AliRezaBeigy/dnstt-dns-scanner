@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-03-02
+
+### Changed
+- Output file (`-output`) now matches stdout: same tunnel-capable section (headers, detailed list, and IP list) is written to the file
+- File output contains only tunnel-capable DNS servers (no metadata header or non-tunnel IPs)
+
 ## [1.2.0] - 2026-03-02
 
 ### Added
@@ -51,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `-verbose` flag to show failed servers on stderr
 - Graceful Ctrl+C interruption with partial results
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/releases/tag/v1.0.0
