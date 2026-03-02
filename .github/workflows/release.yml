@@ -91,12 +91,11 @@ jobs:
         run: |
           TAG="${{ steps.get_tag.outputs.tag }}"
           VERSION="${TAG#v}"
-          # Extract the section for this version from CHANGELOG.md
-          BODY=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
-          # Strip leading/trailing blank lines
-          BODY=$(echo "$BODY" | sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba}')
-          # Write to file to preserve multi-line content
-          echo "$BODY" > release_notes.md
+          # Extract the section and strip leading/trailing blank lines — pure awk (GNU + BSD compatible)
+          awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md \
+            | awk 'NF{found=1} found{buf=buf $0 "\n"} END{printf "%s", buf}' \
+            | awk '{lines[NR]=$0} END{last=NR; while(last>0 && lines[last]=="") last--; for(i=1;i<=last;i++) print lines[i]}' \
+            > release_notes.md
           echo "Release notes extracted for $VERSION"
 
       - name: Create Release (if pushing tag)
