@@ -115,46 +115,33 @@ The `-ips` flag accepts:
 
 ./dnstt-dns-scanner -ips ip-list.txt \
                      -pubkey-file server.pub \
-                     t.example.com \
-                     -output results.txt
+                     -output results.txt \
+                     t.example.com
 ```
 
 **High-performance scan with 100 threads:**
 ```bash
 ./dnstt-dns-scanner -ips 10.10.0.0/16 \
                      -pubkey-file server.pub \
-                     t.example.com \
-                     -threads 100
+                     -threads 100 \
+                     t.example.com
 ```
 
 **Scan with custom timeout and save results:**
 ```bash
 ./dnstt-dns-scanner -ips 192.168.1.0/24 \
                      -pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff \
-                     t.example.com \
                      -timeout 5s \
-                     -output results.txt
-```
-
-**Verbose scan with custom test domain:**
-```bash
-./dnstt-dns-scanner -ips 10.0.0.0/8 \
-                     -pubkey-file server.pub \
-                     t.example.com \
-                     -threads 200 \
-                     -timeout 5s \
-                     -verbose \
-                     -test-domain test.k.markop.ir \
-                     -test-txt "TEST RESULT" \
-                     -output scan_results.txt
+                     -output results.txt \
+                     t.example.com
 ```
 
 **Quick scan (basic connectivity only, faster):**
 ```bash
 ./dnstt-dns-scanner -ips 10.10.0.0/16 \
                      -pubkey-file server.pub \
-                     t.example.com \
-                     -quick
+                     -quick \
+                     t.example.com
 ```
 
 ## How It Works
