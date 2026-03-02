@@ -74,10 +74,11 @@ The `-ips` flag accepts:
 | `-threads N` | Number of concurrent scanning threads (default: `50`) | ❌ No |
 | `-timeout DURATION` | Timeout for each DNS query (default: `10s`, e.g., `5s`, `2m`) | ❌ No |
 | `-verbose` | Show all results including failures | ❌ No |
-| `-output FILE` | Save results to file (includes summary and ready-to-use commands) | ❌ No |
+| `-output FILE` | Save results to file (plain IP list, sorted by latency) | ❌ No |
 | `-test-domain DOMAIN` | Custom domain to query for DNS server test | ❌ No |
 | `-test-txt VALUE` | Expected TXT record value to verify DNS server works correctly | ❌ No |
 | `-quick` | Skip advanced tunnel tests (only perform basic connectivity test) | ❌ No |
+| `-tunnel-only` | Show only DNS servers with full tunnel support in live output | ❌ No |
 
 ### Examples
 
@@ -134,6 +135,14 @@ The `-ips` flag accepts:
                      t.example.com
 ```
 
+**Show only tunnel-capable servers during scan:**
+```bash
+./dnstt-dns-scanner -ips 10.10.0.0/16 \
+                     -pubkey-file server.pub \
+                     -tunnel-only \
+                     t.example.com
+```
+
 ## How It Works
 
 The scanner performs a comprehensive three-stage test for each DNS server:
@@ -167,12 +176,32 @@ The scanner performs a comprehensive three-stage test for each DNS server:
 
 ## Output
 
-The scanner provides real-time feedback and comprehensive results:
+The scanner provides real-time feedback and a clean post-scan summary:
 
-- ✅ **Live Results** - Working servers are printed as they're discovered
-- 📈 **Progress Updates** - Shows progress every 1000 IPs or 10% (whichever is smaller)
-- 📋 **Summary Statistics** - Total scanned, working servers, and capability breakdown
-- 🔧 **Ready-to-Use Commands** - Copy-paste `dnstt-client` commands for each working server
+- ✅ **Live Results** - Working servers printed as discovered with `[EDNS,DNSTT,TUNNEL]` tags and latency
+- 📈 **Progress Updates** - Shows progress every 1000 IPs or 10% (whichever is smaller), to stderr
+- 📋 **Summary Statistics** - Total scanned, working servers, and capability breakdown, to stderr
+- 🎯 **Post-Scan Tunnel List** - After the scan, stdout shows tunnel-capable servers sorted by latency with per-test breakdown, followed by a plain IP list
+
+**Example post-scan output:**
+```
+Tunnel-capable DNS servers:
+  1.1.1.1 (latency: 8ms) [basic: 2ms, stream2: 1ms, transfer: 3ms, multi: 1ms, bidir: 1ms]
+  8.8.8.8 (latency: 58ms) [basic: 12ms, stream2: 8ms, transfer: 15ms, multi: 11ms, bidir: 12ms]
+---
+Tunnel-capable DNS servers IPs:
+1.1.1.1
+8.8.8.8
+```
+
+With `-quick` the detail section shows only the basic test latency:
+```
+Tunnel-capable DNS servers:
+  1.1.1.1 (latency: 8ms) [basic: 8ms]
+---
+Tunnel-capable DNS servers IPs:
+1.1.1.1
+```
 
 ### Status Tags
 
@@ -198,8 +227,8 @@ Each discovered DNS server shows status tags indicating its capabilities:
 - 🔍 **Comprehensive DNS Testing** - Tests basic DNS functionality, EDNS(0) support, and dnstt encoding compatibility
 - 🚀 **Full Tunnel Verification** - Verifies complete tunnel connectivity including SOCKS5 proxy support (as deployed by [dnstt-deploy](https://github.com/bugfloyd/dnstt-deploy))
 - ⚡ **High Performance** - Multi-threaded scanning with configurable concurrency
-- 📊 **Detailed Reporting** - Shows latency, capabilities, and provides ready-to-use commands
-- 💾 **Export Results** - Save scan results to file with metadata and commands
+- 📊 **Detailed Reporting** - Shows latency per test, sorted by fastest server
+- 💾 **Export Results** - Save results to file as a plain IP list sorted by latency
 - 🎯 **CIDR Support** - Scan entire network ranges efficiently
 - 🔄 **Graceful Interruption** - Press Ctrl+C to stop and see partial results
 
