@@ -8,6 +8,7 @@ A powerful tool to scan IP address ranges and discover DNS servers that can be u
 
 ## Table of Contents
 
+- [Quick Install](#quick-install)
 - [Requirements](#requirements)
 - [Installation](#installation)
   - [Pre-built Binaries](#pre-built-binaries)
@@ -21,6 +22,33 @@ A powerful tool to scan IP address ranges and discover DNS servers that can be u
 - [Building](#building)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
+
+## Quick Install (dnstt + dnstt-dns-scanner + xray)
+
+Installer for load balancing and finding best dns server for dnstt on Linux or macOS (amd64 / arm64):
+
+```bash
+wget https://raw.githubusercontent.com/AliRezaBeigy/dnstt-dns-scanner/main/scripts/install.sh
+chmod a+x install.sh
+./install
+
+# or 
+
+bash <(curl -fsSL https://raw.githubusercontent.com/AliRezaBeigy/dnstt-dns-scanner/main/scripts/install.sh)
+```
+
+Note: If you had no internet access you can put the required tools in the specified folder by yourself.
+
+### How it works:
+  1. dnstt-dns-scanner scans all DNS servers in dns.txt every 10 minutes,
+      testing each one for a working DNSTT tunnel to your domain.
+  2. Servers with tunnels are ranked by latency and saved to dns_with_tunnels.txt.
+      Servers that fail 10 consecutive scans are removed from the working list.
+  3. Every 20 scans, all IPs are restored from the original dns.txt and failure
+      counts are reset — giving previously-removed servers another chance.
+  4. run_dnstt.ps1 distributes the best DNS servers across all dnstt-client
+      instances, health-checks them every 5 seconds, and restarts any that drop.
+  5. xray load-balances your traffic across all live tunnels.
 
 ## Requirements
 
