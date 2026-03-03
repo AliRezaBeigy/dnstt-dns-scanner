@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# dnstt + dnstt-dns-scanner + xray install script
+# dnstt / slipstream-rust + dnstt-dns-scanner + xray install script
 # Supports: Linux amd64/arm64, macOS amd64/arm64
 # =============================================================================
 
@@ -46,6 +46,7 @@ detect_platform() {
 
     DNSTT_CLIENT_ASSET="dnstt-client-${OS_NAME}-${ARCH_NAME}"
     SCANNER_ASSET="dnstt-dns-scanner-${OS_NAME}-${ARCH_NAME}"
+    SLIPSTREAM_ASSET="slipstream-client-${OS_NAME}-${ARCH_NAME}"
 
     info "Detected platform: $OS_NAME / $ARCH_NAME"
 }
@@ -86,6 +87,26 @@ check_deps() {
     fi
 
     success "Dependencies OK"
+}
+
+# ---------------------------------------------------------------------------
+# Step 3b — Choose tunnel mode
+# ---------------------------------------------------------------------------
+ask_tunnel_mode() {
+    echo ""
+    echo -e "${CYAN}=== Tunnel Mode ===${NC}"
+    echo "  1) dnstt only"
+    echo "  2) slipstream-rust only"
+    echo "  3) Both (half instances dnstt, half slipstream-rust)"
+    echo -e "${CYAN}Enter your choice [default: 1]:${NC} \c"
+    read -r mode_choice
+    TUNNEL_MODE="${mode_choice:-1}"
+    case "$TUNNEL_MODE" in
+        1) success "Mode: dnstt only" ;;
+        2) success "Mode: slipstream-rust only" ;;
+        3) success "Mode: Both (dnstt + slipstream-rust)" ;;
+        *) warn "Invalid choice, defaulting to dnstt only."; TUNNEL_MODE=1 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -158,18 +179,36 @@ download_tools() {
         success "xray installed → $INSTALL_DIR/xray"
     fi
 
-    # -- dnstt-client --
-    if [ -f "$INSTALL_DIR/dnstt-client" ]; then
-        info "dnstt-client already exists, skipping download."
-    else
-        local dnstt_url
-        dnstt_url=$(get_latest_asset_url "net2share/dnstt" "$DNSTT_CLIENT_ASSET") || {
-            warn "Could not auto-resolve dnstt-client URL. Trying direct URL..."
-            dnstt_url="https://github.com/net2share/dnstt/releases/latest/download/${DNSTT_CLIENT_ASSET}"
-        }
-        download_file "$dnstt_url" "$INSTALL_DIR/dnstt-client" "dnstt-client" "https://github.com/net2share/dnstt/releases/latest"
-        chmod +x "$INSTALL_DIR/dnstt-client"
-        success "dnstt-client installed → $INSTALL_DIR/dnstt-client"
+    # -- dnstt-client (skip for slipstream-only mode) --
+    if [ "${TUNNEL_MODE:-1}" != "2" ]; then
+        if [ -f "$INSTALL_DIR/dnstt-client" ]; then
+            info "dnstt-client already exists, skipping download."
+        else
+            local dnstt_url
+            dnstt_url=$(get_latest_asset_url "net2share/dnstt" "$DNSTT_CLIENT_ASSET") || {
+                warn "Could not auto-resolve dnstt-client URL. Trying direct URL..."
+                dnstt_url="https://github.com/net2share/dnstt/releases/latest/download/${DNSTT_CLIENT_ASSET}"
+            }
+            download_file "$dnstt_url" "$INSTALL_DIR/dnstt-client" "dnstt-client" "https://github.com/net2share/dnstt/releases/latest"
+            chmod +x "$INSTALL_DIR/dnstt-client"
+            success "dnstt-client installed → $INSTALL_DIR/dnstt-client"
+        fi
+    fi
+
+    # -- slipstream-rust client (skip for dnstt-only mode) --
+    if [ "${TUNNEL_MODE:-1}" != "1" ]; then
+        if [ -f "$INSTALL_DIR/slipstream-client" ]; then
+            info "slipstream-client already exists, skipping download."
+        else
+            local slip_url
+            slip_url=$(get_latest_asset_url "AliRezaBeigy/slipstream-rust-deploy" "$SLIPSTREAM_ASSET") || {
+                warn "Could not auto-resolve slipstream-client URL. Trying direct URL..."
+                slip_url="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/${SLIPSTREAM_ASSET}"
+            }
+            download_file "$slip_url" "$INSTALL_DIR/slipstream-client" "slipstream-client" "https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest"
+            chmod +x "$INSTALL_DIR/slipstream-client"
+            success "slipstream-client installed → $INSTALL_DIR/slipstream-client"
+        fi
     fi
 
     # -- dnstt-dns-scanner --
@@ -270,18 +309,150 @@ ask_dnstt_settings() {
     [ -z "$DNSTT_PUBKEY" ] && die "Pubkey cannot be empty."
 
     while true; do
-        echo -e "${CYAN}Enter number of dnstt instances [default: 25]:${NC} \c"
-        read -r instance_input
-        INSTANCE_COUNT="${instance_input:-25}"
-        if [[ "$INSTANCE_COUNT" =~ ^[0-9]+$ ]] && [ "$INSTANCE_COUNT" -ge 1 ] && [ "$INSTANCE_COUNT" -le 100 ]; then
-            break
+        if [ "${TUNNEL_MODE:-1}" = "3" ]; then
+            echo -e "${CYAN}Enter number of dnstt instances (half of total) [default: 13]:${NC} \c"
+            read -r instance_input
+            DNSTT_INSTANCE_COUNT="${instance_input:-13}"
+            if [[ "$DNSTT_INSTANCE_COUNT" =~ ^[0-9]+$ ]] && [ "$DNSTT_INSTANCE_COUNT" -ge 1 ] && [ "$DNSTT_INSTANCE_COUNT" -le 100 ]; then
+                break
+            fi
+        else
+            echo -e "${CYAN}Enter number of dnstt instances [default: 25]:${NC} \c"
+            read -r instance_input
+            DNSTT_INSTANCE_COUNT="${instance_input:-25}"
+            if [[ "$DNSTT_INSTANCE_COUNT" =~ ^[0-9]+$ ]] && [ "$DNSTT_INSTANCE_COUNT" -ge 1 ] && [ "$DNSTT_INSTANCE_COUNT" -le 100 ]; then
+                break
+            fi
         fi
         warn "Please enter a number between 1 and 100."
     done
 
-    START_PORT=7001
-    END_PORT=$((7001 + INSTANCE_COUNT - 1))
-    success "Instances: $INSTANCE_COUNT (ports $START_PORT–$END_PORT)"
+    DNSTT_START_PORT=7001
+    DNSTT_END_PORT=$((DNSTT_START_PORT + DNSTT_INSTANCE_COUNT - 1))
+    success "dnstt instances: $DNSTT_INSTANCE_COUNT (ports $DNSTT_START_PORT–$DNSTT_END_PORT)"
+}
+
+# ---------------------------------------------------------------------------
+# Step 6b — slipstream-rust settings
+# ---------------------------------------------------------------------------
+# Read domain from existing run_slipstream.sh (for reinstall)
+get_slipstream_defaults_from_script() {
+    local script_path="$1"
+    [ ! -f "$script_path" ] && return
+    default_slip_domain=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^DOMAIN=\"(.*)\" ]]; then
+            default_slip_domain="${BASH_REMATCH[1]}"
+        fi
+    done < "$script_path" 2>/dev/null
+}
+
+ask_slipstream_settings() {
+    echo ""
+    echo -e "${CYAN}=== slipstream-rust Settings ===${NC}"
+
+    default_slip_domain=""
+    get_slipstream_defaults_from_script "$INSTALL_DIR/run_slipstream.sh"
+
+    if [ -n "$default_slip_domain" ]; then
+        echo -e "${CYAN}Enter slipstream domain [default: $default_slip_domain]:${NC} \c"
+    else
+        echo -e "${CYAN}Enter slipstream domain:${NC} \c"
+    fi
+    read -r SLIP_DOMAIN
+    SLIP_DOMAIN="${SLIP_DOMAIN:-$default_slip_domain}"
+    [ -z "$SLIP_DOMAIN" ] && die "Slipstream domain cannot be empty."
+
+    # In slipstream-only mode, still need dnstt credentials for the scanner
+    if [ "${TUNNEL_MODE:-1}" = "2" ]; then
+        echo ""
+        echo -e "${YELLOW}[INFO]${NC} The DNS scanner requires a dnstt server to verify tunnel reachability."
+        echo -e "${CYAN}Enter dnstt domain (for scanner only):${NC} \c"
+        read -r DNSTT_DOMAIN
+        [ -z "$DNSTT_DOMAIN" ] && die "dnstt domain cannot be empty."
+
+        echo -e "${CYAN}Enter dnstt server pubkey (for scanner only):${NC} \c"
+        read -r DNSTT_PUBKEY
+        [ -z "$DNSTT_PUBKEY" ] && die "dnstt pubkey cannot be empty."
+    fi
+
+    while true; do
+        if [ "${TUNNEL_MODE:-1}" = "3" ]; then
+            echo -e "${CYAN}Enter number of slipstream instances (half of total) [default: 12]:${NC} \c"
+            read -r instance_input
+            SLIP_INSTANCE_COUNT="${instance_input:-12}"
+            if [[ "$SLIP_INSTANCE_COUNT" =~ ^[0-9]+$ ]] && [ "$SLIP_INSTANCE_COUNT" -ge 1 ] && [ "$SLIP_INSTANCE_COUNT" -le 100 ]; then
+                break
+            fi
+        else
+            echo -e "${CYAN}Enter number of slipstream instances [default: 25]:${NC} \c"
+            read -r instance_input
+            SLIP_INSTANCE_COUNT="${instance_input:-25}"
+            if [[ "$SLIP_INSTANCE_COUNT" =~ ^[0-9]+$ ]] && [ "$SLIP_INSTANCE_COUNT" -ge 1 ] && [ "$SLIP_INSTANCE_COUNT" -le 100 ]; then
+                break
+            fi
+        fi
+        warn "Please enter a number between 1 and 100."
+    done
+
+    # Slipstream ports start right after dnstt ports (or at 7001 if dnstt not used)
+    if [ "${TUNNEL_MODE:-1}" = "2" ]; then
+        SLIP_START_PORT=7001
+    else
+        SLIP_START_PORT=$((DNSTT_END_PORT + 1))
+    fi
+    SLIP_END_PORT=$((SLIP_START_PORT + SLIP_INSTANCE_COUNT - 1))
+    success "slipstream instances: $SLIP_INSTANCE_COUNT (ports $SLIP_START_PORT–$SLIP_END_PORT)"
+
+    echo ""
+    echo -e "${CYAN}Does slipstream SOCKS require authentication? [y/N]:${NC} \c"
+    read -r slip_auth_choice
+    if [[ "${slip_auth_choice,,}" == "y" ]]; then
+        SLIP_AUTH=1
+        echo -e "${CYAN}Enter slipstream SOCKS username:${NC} \c"
+        read -r SLIP_USER
+        [ -z "$SLIP_USER" ] && die "SOCKS username cannot be empty."
+        echo -e "${CYAN}Enter slipstream SOCKS password:${NC} \c"
+        read -r SLIP_PASS
+        [ -z "$SLIP_PASS" ] && die "SOCKS password cannot be empty."
+        success "Slipstream SOCKS auth configured."
+    else
+        SLIP_AUTH=0
+        SLIP_USER=""
+        SLIP_PASS=""
+    fi
+}
+
+# Set unified port range variables used by xray config
+set_port_range() {
+    # Initialize defaults for modes that don't use both tools
+    DNSTT_INSTANCE_COUNT="${DNSTT_INSTANCE_COUNT:-0}"
+    DNSTT_START_PORT="${DNSTT_START_PORT:-7001}"
+    DNSTT_END_PORT="${DNSTT_END_PORT:-7000}"
+    SLIP_INSTANCE_COUNT="${SLIP_INSTANCE_COUNT:-0}"
+    SLIP_START_PORT="${SLIP_START_PORT:-7001}"
+    SLIP_END_PORT="${SLIP_END_PORT:-7000}"
+
+    case "${TUNNEL_MODE:-1}" in
+        1)
+            # dnstt only
+            START_PORT=$DNSTT_START_PORT
+            END_PORT=$DNSTT_END_PORT
+            INSTANCE_COUNT=$DNSTT_INSTANCE_COUNT
+            ;;
+        2)
+            # slipstream only
+            START_PORT=$SLIP_START_PORT
+            END_PORT=$SLIP_END_PORT
+            INSTANCE_COUNT=$SLIP_INSTANCE_COUNT
+            ;;
+        3)
+            # both
+            START_PORT=$DNSTT_START_PORT
+            END_PORT=$SLIP_END_PORT
+            INSTANCE_COUNT=$((DNSTT_INSTANCE_COUNT + SLIP_INSTANCE_COUNT))
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -406,6 +577,14 @@ EOF
     local i=1
     for port in $(seq "$START_PORT" "$END_PORT"); do
         [ $i -gt 1 ] && outbounds="${outbounds},"$'\n'
+        # Determine if this port belongs to the slipstream range and auth is enabled
+        local slip_auth_entry=""
+        if [ "${SLIP_AUTH:-0}" -eq 1 ] && [ -n "${SLIP_START_PORT:-}" ] && [ -n "${SLIP_END_PORT:-}" ] \
+            && [ "$port" -ge "$SLIP_START_PORT" ] && [ "$port" -le "$SLIP_END_PORT" ]; then
+            slip_auth_entry="
+                    \"user\": \"${SLIP_USER}\",
+                    \"pass\": \"${SLIP_PASS}\","
+        fi
         outbounds="${outbounds}        {
             \"tag\": \"proxy-${i}\",
             \"protocol\": \"socks\",
@@ -413,7 +592,7 @@ EOF
                 \"servers\": [{
                     \"address\": \"127.0.0.1\",
                     \"ota\": false,
-                    \"port\": ${port},
+                    \"port\": ${port},${slip_auth_entry}
                     \"level\": 1
                 }]
             },
@@ -470,8 +649,16 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Step 9 — Generate run_dnstt.sh (fully embedded, no external template)
+# Step 9 — Generate runner scripts based on tunnel mode
 # ---------------------------------------------------------------------------
+generate_runner_scripts() {
+    case "${TUNNEL_MODE:-1}" in
+        1) generate_run_dnstt ;;
+        2) generate_run_slipstream ;;
+        3) generate_run_dnstt; generate_run_slipstream; generate_run_both ;;
+    esac
+}
+
 generate_run_dnstt() {
     info "Generating run_dnstt.sh..."
 
@@ -486,8 +673,8 @@ DNS_FAILURES_FILE="dns_failures.txt"
 DNS_PIDS_FILE="dns_pids.txt"
 PUBKEY="$DNSTT_PUBKEY"
 DOMAIN="$DNSTT_DOMAIN"
-START_PORT=7001
-END_PORT=$END_PORT
+START_PORT=$DNSTT_START_PORT
+END_PORT=$DNSTT_END_PORT
 SCAN_INTERVAL=600
 
 # Create logs directory if it doesn't exist
@@ -583,9 +770,13 @@ scan_and_get_all_dns() {
     cat "\$_DNS_FILE" | while read ip; do echo "  - \$ip"; done
 
     local dns_count=\$(wc -l < "\$_DNS_FILE" | tr -d ' ')
+    local cpu_cores=\$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1)
     local threads=\$((dns_count / 10))
-    if [ \$threads -lt 1 ]; then threads=1; fi
-    echo "DNS count: \$dns_count, calculated threads: \$threads"
+    local max_threads=\$((cpu_cores * 50))
+    [ \$max_threads -gt 500 ] && max_threads=500
+    [ \$threads -gt \$max_threads ] && threads=\$max_threads
+    [ \$threads -lt 1 ] && threads=1
+    echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
 
     # When scanning more than 512 DNS, use -quick to skip aggressive tests for speed (do not use quick to find a really good DNS)
     local quick_arg=""
@@ -1076,6 +1267,425 @@ DNSTT_SCRIPT
     success "run_dnstt.sh written → $INSTALL_DIR/run_dnstt.sh"
 }
 
+generate_run_slipstream() {
+    info "Generating run_slipstream.sh..."
+
+    cat > "$INSTALL_DIR/run_slipstream.sh" <<SLIP_SCRIPT
+#!/bin/bash
+
+# Configuration
+DNS_FILE="dns.txt"
+_DNS_FILE="_dns.txt"
+DNS_ASSIGNMENTS_FILE="slip_dns_assignments.txt"
+DNS_FAILURES_FILE="slip_dns_failures.txt"
+DNS_PIDS_FILE="slip_dns_pids.txt"
+DOMAIN="$SLIP_DOMAIN"
+SCANNER_DOMAIN="$DNSTT_DOMAIN"
+SCANNER_PUBKEY="$DNSTT_PUBKEY"
+START_PORT=$SLIP_START_PORT
+END_PORT=$SLIP_END_PORT
+SCAN_INTERVAL=600
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Initialize _dns.txt from dns.txt if it doesn't exist
+if [ ! -f "\$_DNS_FILE" ]; then
+    if [ -f "\$DNS_FILE" ]; then
+        echo "Copying \$DNS_FILE to \$_DNS_FILE for faster scanning..."
+        cp "\$DNS_FILE" "\$_DNS_FILE"
+    else
+        echo "WARNING: \$DNS_FILE not found, creating empty \$_DNS_FILE"
+        touch "\$_DNS_FILE"
+    fi
+fi
+
+# Initialize tracking files if they don't exist
+[ ! -f "\$DNS_FAILURES_FILE" ] && touch "\$DNS_FAILURES_FILE"
+[ ! -f "\$DNS_PIDS_FILE" ]     && touch "\$DNS_PIDS_FILE"
+
+# Function to refill _dns.txt from dns.txt if empty
+refill_dns_file() {
+    if [ ! -s "\$_DNS_FILE" ]; then
+        if [ -f "\$DNS_FILE" ] && [ -s "\$DNS_FILE" ]; then
+            echo "WARNING: \$_DNS_FILE is empty, refilling from \$DNS_FILE..."
+            cp "\$DNS_FILE" "\$_DNS_FILE"
+            echo "Refilled \$_DNS_FILE with \$(wc -l < "\$_DNS_FILE") DNS entries from \$DNS_FILE"
+            > "\$DNS_FAILURES_FILE"
+            echo "Reset failure tracking"
+            return 0
+        else
+            echo "ERROR: Cannot refill \$_DNS_FILE - \$DNS_FILE is empty or missing"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Function to convert latency to a sortable numeric value (milliseconds)
+latency_to_sortable() {
+    local latency_str="\$1"
+    latency_str=\$(echo "\$latency_str" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+    if [[ "\$latency_str" =~ ([0-9.]+)(µs|ms|s) ]]; then
+        local value="\${BASH_REMATCH[1]}"
+        local unit="\${BASH_REMATCH[2]}"
+        case "\$unit" in
+            µs) echo "\$value" | awk '{printf "%.10f", \$1/1000}' ;;
+            ms) echo "\$value" ;;
+            s)  echo "\$value" | awk '{printf "%.10f", \$1*1000}' ;;
+        esac
+    else
+        echo "999999.0"
+    fi
+}
+
+# Scan DNS servers using dnstt-dns-scanner and collect those with tunnels
+scan_and_get_all_dns() {
+    local DNS_WITH_TUNNELS_FILE="slip_dns_with_tunnels.txt"
+
+    echo "=== Scanning DNS servers for slipstream ==="
+    echo "DNS file: \$_DNS_FILE"
+    echo "Domain: \$DOMAIN"
+
+    if [ ! -f "./dnstt-dns-scanner" ] && [ ! -f "./dnstt-dns-scanner.exe" ]; then
+        echo "ERROR: dnstt-dns-scanner executable not found in current directory"
+        return 1
+    fi
+
+    if [ ! -f "\$_DNS_FILE" ] || [ ! -s "\$_DNS_FILE" ]; then
+        if ! refill_dns_file; then
+            echo "ERROR: Cannot proceed with empty DNS file"
+            return 1
+        fi
+    fi
+
+    local dns_count=\$(wc -l < "\$_DNS_FILE" | tr -d ' ')
+    local cpu_cores=\$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1)
+    local threads=\$((dns_count / 10))
+    local max_threads=\$((cpu_cores * 50))
+    [ \$max_threads -gt 500 ] && max_threads=500
+    [ \$threads -gt \$max_threads ] && threads=\$max_threads
+    [ \$threads -lt 1 ] && threads=1
+    echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
+
+    local quick_arg=""
+    [ \$dns_count -gt 512 ] && quick_arg=" -quick"
+
+    # Use the dnstt server credentials to scan — slipstream needs reachable DNS servers
+    local scanner_output
+    scanner_output=\$(./dnstt-dns-scanner -ips "\$_DNS_FILE" -pubkey "\$SCANNER_PUBKEY" \
+        -test-domain test.k.markop.ir -test-txt "TEST RESULT" -threads "\$threads"\${quick_arg} "\$SCANNER_DOMAIN" 2>&1 || true)
+
+    echo "\$scanner_output"
+
+    local temp_file=\$(mktemp)
+    local dns_with_tunnels=()
+    local scanned_dns=()
+    while IFS= read -r ip; do [ -n "\$ip" ] && scanned_dns+=("\$ip"); done < "\$_DNS_FILE"
+
+    while IFS= read -r line; do
+        # Accept any working DNS (EDNS or DNSTT tag) — slipstream doesn't need dnstt tunnel
+        if echo "\$line" | grep -qE '✓'; then
+            local ip=\$(echo "\$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -n1)
+            local latency=\$(echo "\$line" | sed -n 's/.*latency:[[:space:]]*\([^)]*\).*/\1/p')
+            if [ -n "\$ip" ] && [ -n "\$latency" ]; then
+                local latency_sortable=\$(latency_to_sortable "\$latency")
+                echo "\$latency_sortable|\$ip" >> "\$temp_file"
+                dns_with_tunnels+=("\$ip")
+            fi
+        fi
+    done <<< "\$scanner_output"
+
+    # Update failure tracking
+    local fail_inc=1
+    [ -n "\$quick_arg" ] && fail_inc=5
+    local new_failures_file=\$(mktemp)
+
+    for scanned_ip in "\${scanned_dns[@]}"; do
+        local has_tunnel=0
+        for tunnel_ip in "\${dns_with_tunnels[@]}"; do
+            [ "\$scanned_ip" = "\$tunnel_ip" ] && { has_tunnel=1; break; }
+        done
+        local current_count=0
+        if [ -f "\$DNS_FAILURES_FILE" ]; then
+            local existing_count=\$(grep "^\${scanned_ip}|" "\$DNS_FAILURES_FILE" | cut -d'|' -f2)
+            [ -n "\$existing_count" ] && current_count=\$existing_count
+        fi
+        if [ \$has_tunnel -eq 0 ]; then
+            current_count=\$((current_count + fail_inc))
+            echo "\${scanned_ip}|\${current_count}" >> "\$new_failures_file"
+            if [ \$current_count -ge 10 ]; then
+                echo "DNS \$scanned_ip: Removed from \$_DNS_FILE (10 consecutive failures)"
+                local temp_dns_file=\$(mktemp)
+                grep -v "^\${scanned_ip}\$" "\$_DNS_FILE" > "\$temp_dns_file"
+                mv "\$temp_dns_file" "\$_DNS_FILE"
+            fi
+        fi
+    done
+    mv "\$new_failures_file" "\$DNS_FAILURES_FILE"
+
+    if [ -s "\$temp_file" ]; then
+        sort -t'|' -k1 -n "\$temp_file" | cut -d'|' -f2 > "\$DNS_WITH_TUNNELS_FILE"
+        echo "=== Saved \$(wc -l < "\$DNS_WITH_TUNNELS_FILE") working DNS servers to \$DNS_WITH_TUNNELS_FILE ==="
+        rm -f "\$temp_file"
+        return 0
+    else
+        echo "ERROR: No working DNS servers found!"
+        rm -f "\$temp_file"
+        > "\$DNS_WITH_TUNNELS_FILE"
+        return 1
+    fi
+}
+
+# Build slipstream-client command
+build_slip_cmd() {
+    local dns_ip="\$1"
+    local port="\$2"
+    echo "./slipstream-client -r \$dns_ip -d \$DOMAIN -l \$port --tcp-listen-host 127.0.0.1"
+}
+
+# PID management
+get_instance_pid() {
+    local port=\$1
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        local pid=\$(grep "^\${port}|" "\$DNS_PIDS_FILE" | cut -d'|' -f2)
+        if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then echo "\$pid"; return 0; fi
+        remove_instance_pid "\$port"
+    fi
+    return 1
+}
+
+save_instance_pid() {
+    local port=\$1; local pid=\$2
+    local temp_file=\$(mktemp)
+    [ -f "\$DNS_PIDS_FILE" ] && grep -v "^\${port}|" "\$DNS_PIDS_FILE" > "\$temp_file" 2>/dev/null || true
+    echo "\${port}|\${pid}" >> "\$temp_file"
+    mv "\$temp_file" "\$DNS_PIDS_FILE"
+}
+
+remove_instance_pid() {
+    local port=\$1
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        local temp_file=\$(mktemp)
+        grep -v "^\${port}|" "\$DNS_PIDS_FILE" > "\$temp_file" 2>/dev/null || true
+        mv "\$temp_file" "\$DNS_PIDS_FILE"
+    fi
+}
+
+stop_instance_gracefully() {
+    local port=\$1
+    local pid=\$(get_instance_pid "\$port")
+    if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then
+        kill -TERM "\$pid" 2>/dev/null
+        local wait_count=0
+        while [ \$wait_count -lt 50 ] && kill -0 "\$pid" 2>/dev/null; do
+            sleep 0.1; wait_count=\$((wait_count + 1))
+        done
+        kill -0 "\$pid" 2>/dev/null && kill -KILL "\$pid" 2>/dev/null
+        remove_instance_pid "\$port"; return 0
+    else
+        pkill -f "slipstream-client.*\$port" 2>/dev/null; remove_instance_pid "\$port"; return 1
+    fi
+}
+
+get_assigned_dns() {
+    local port=\$1
+    [ -f "\$DNS_ASSIGNMENTS_FILE" ] && grep "^\${port}|" "\$DNS_ASSIGNMENTS_FILE" | cut -d'|' -f2
+}
+
+is_instance_running() {
+    local port=\$1
+    local pid=\$(get_instance_pid "\$port")
+    [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null && return 0
+    return 1
+}
+
+start_instance() {
+    local port=\$1; local dns_ip=\$2
+    local log_file="logs/slip_client_\$port.log"
+    stop_instance_gracefully "\$port"
+    local cmd=\$(build_slip_cmd "\$dns_ip" "\$port")
+    echo "Starting slipstream-client on port \$port with DNS \$dns_ip"
+    nohup \$cmd > "\$log_file" 2>&1 &
+    local pid=\$!
+    save_instance_pid "\$port" "\$pid"
+    sleep 0.2
+    if ! kill -0 "\$pid" 2>/dev/null; then
+        echo "WARNING: Process \$pid died immediately after start"
+        remove_instance_pid "\$port"; return 1
+    fi
+    return 0
+}
+
+check_and_restart() {
+    local port=\$1
+    local log_file="logs/slip_client_\$port.log"
+    local needs_restart=0
+    is_instance_running "\$port" || needs_restart=1
+
+    if [ \$needs_restart -eq 1 ]; then
+        echo "Restarting slipstream-client on port \$port"
+        local assigned_dns=\$(get_assigned_dns "\$port")
+        if [ -n "\$assigned_dns" ]; then
+            rm -f "\$log_file"
+            stop_instance_gracefully "\$port"
+            sleep 1
+            start_instance "\$port" "\$assigned_dns"
+        else
+            echo "Warning: No DNS assigned to port \$port, skipping restart"
+            remove_instance_pid "\$port"
+        fi
+    fi
+}
+
+distribute_dns_to_instances() {
+    local DNS_WITH_TUNNELS_FILE="slip_dns_with_tunnels.txt"
+    [ ! -f "\$DNS_WITH_TUNNELS_FILE" ] || [ ! -s "\$DNS_WITH_TUNNELS_FILE" ] && {
+        echo "Error: No working DNS available"; return 1; }
+
+    local current_dns=()
+    while IFS= read -r ip; do [ -n "\$ip" ] && current_dns+=("\$ip"); done < "\$DNS_WITH_TUNNELS_FILE"
+    [ \${#current_dns[@]} -eq 0 ] && { echo "Error: No DNS found"; return 1; }
+
+    echo "Distributing \${#current_dns[@]} DNS servers across slipstream instances..."
+
+    declare -A port_assignments
+    local idx=0
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        local dns_ip="\${current_dns[\$((idx % \${#current_dns[@]}))]}"
+        port_assignments["\$port"]="\$dns_ip"
+        idx=\$((idx + 1))
+    done
+
+    > "\$DNS_ASSIGNMENTS_FILE"
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        echo "\${port}|\${port_assignments[\$port]}" >> "\$DNS_ASSIGNMENTS_FILE"
+    done
+
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        start_instance "\$port" "\${port_assignments[\$port]}"
+        sleep 0.1
+    done
+    echo "Slipstream distribution complete: \${#port_assignments[@]} instances"
+    return 0
+}
+
+echo "=========================================="
+echo "Starting slipstream-runner"
+echo "Working directory: \$(pwd)"
+echo "Domain: \$DOMAIN"
+echo "Port range: \$START_PORT-\$END_PORT"
+echo "=========================================="
+echo ""
+
+if [ -f "\$DNS_ASSIGNMENTS_FILE" ] && [ -s "\$DNS_ASSIGNMENTS_FILE" ]; then
+    echo "Previous assignments found, starting instances..."
+    while IFS='|' read -r port dns_ip; do
+        [ -n "\$port" ] && [ -n "\$dns_ip" ] && start_instance "\$port" "\$dns_ip"
+    done < "\$DNS_ASSIGNMENTS_FILE"
+else
+    echo "Running initial DNS scan..."
+    scan_and_get_all_dns && distribute_dns_to_instances || { echo "ERROR: Initial scan failed. Exiting."; exit 1; }
+fi
+
+# Background periodic scanner
+(
+    SCAN_COUNT=0
+    while true; do
+        SCAN_COUNT=\$((SCAN_COUNT + 1))
+        if [ \$((SCAN_COUNT % 20)) -eq 0 ] && [ -f "\$DNS_FILE" ] && [ -s "\$DNS_FILE" ]; then
+            echo "=== Scan #\${SCAN_COUNT}: Full refresh ==="
+            cp "\$DNS_FILE" "\$_DNS_FILE"
+            > "\$DNS_FAILURES_FILE"
+        fi
+        scan_start_time=\$(date +%s)
+        echo "Running periodic DNS scan (#\${SCAN_COUNT})..."
+        if scan_and_get_all_dns; then
+            distribute_dns_to_instances
+        else
+            refill_dns_file
+        fi
+        scan_end_time=\$(date +%s)
+        scan_duration=\$((scan_end_time - scan_start_time))
+        sleep_duration=\$((600 - scan_duration))
+        [ \$sleep_duration -lt 0 ] && sleep_duration=0
+        echo "Scan done in \${scan_duration}s. Next in \${sleep_duration}s."
+        sleep \$sleep_duration
+    done
+) &
+SCANNER_PID=\$!
+
+cleanup() {
+    echo "Shutting down slipstream-runner..."
+    kill \$SCANNER_PID 2>/dev/null
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        while IFS='|' read -r port pid; do
+            [ -n "\$port" ] && stop_instance_gracefully "\$port"
+        done < "\$DNS_PIDS_FILE"
+    fi
+    pkill -f "slipstream-client" 2>/dev/null
+    exit
+}
+trap cleanup SIGINT SIGTERM
+
+while true; do
+    echo "Checking slipstream instances..."
+    [ ! -s "\$_DNS_FILE" ] && refill_dns_file
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        check_and_restart \$port
+    done
+    sleep 5
+done
+SLIP_SCRIPT
+
+    chmod +x "$INSTALL_DIR/run_slipstream.sh"
+    success "run_slipstream.sh written → $INSTALL_DIR/run_slipstream.sh"
+}
+
+generate_run_both() {
+    info "Generating run_both.sh (dnstt + slipstream combined)..."
+
+    cat > "$INSTALL_DIR/run_both.sh" <<BOTH_SCRIPT
+#!/bin/bash
+# Starts both dnstt and slipstream-rust runners side by side.
+# dnstt:       ports $DNSTT_START_PORT–$DNSTT_END_PORT
+# slipstream:  ports $SLIP_START_PORT–$SLIP_END_PORT
+
+set -euo pipefail
+
+SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+cd "\$SCRIPT_DIR"
+
+mkdir -p logs
+
+echo "Starting dnstt runner (ports $DNSTT_START_PORT–$DNSTT_END_PORT)..."
+bash run_dnstt.sh > logs/dnstt-runner.log 2>&1 &
+DNSTT_PID=\$!
+echo "dnstt runner PID: \$DNSTT_PID"
+
+echo "Starting slipstream runner (ports $SLIP_START_PORT–$SLIP_END_PORT)..."
+bash run_slipstream.sh > logs/slip-runner.log 2>&1 &
+SLIP_PID=\$!
+echo "slipstream runner PID: \$SLIP_PID"
+
+cleanup() {
+    echo "Stopping both runners..."
+    kill \$DNSTT_PID 2>/dev/null || true
+    kill \$SLIP_PID  2>/dev/null || true
+    pkill -f "dnstt-client"      2>/dev/null || true
+    pkill -f "slipstream-client" 2>/dev/null || true
+    exit
+}
+trap cleanup SIGINT SIGTERM
+
+echo "Both runners started. Logs: logs/dnstt-runner.log and logs/slip-runner.log"
+wait
+BOTH_SCRIPT
+
+    chmod +x "$INSTALL_DIR/run_both.sh"
+    success "run_both.sh written → $INSTALL_DIR/run_both.sh"
+}
+
 # ---------------------------------------------------------------------------
 # Step 10 — Auto-start service (optional)
 # ---------------------------------------------------------------------------
@@ -1095,6 +1705,13 @@ install_service() {
             warn "  sudo systemctl daemon-reload && sudo systemctl enable --now dnstt-runner xray-dnstt"
         fi
 
+        local runner_script
+        case "${TUNNEL_MODE:-1}" in
+            2) runner_script="$INSTALL_DIR/run_slipstream.sh" ;;
+            3) runner_script="$INSTALL_DIR/run_both.sh" ;;
+            *) runner_script="$INSTALL_DIR/run_dnstt.sh" ;;
+        esac
+
         cat > /tmp/dnstt-runner.service <<EOF
 [Unit]
 Description=dnstt-runner - DNS tunnel client manager
@@ -1103,7 +1720,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/bin/bash $INSTALL_DIR/run_dnstt.sh
+ExecStart=/bin/bash ${runner_script}
 Restart=always
 RestartSec=5
 
@@ -1151,6 +1768,13 @@ EOF
         local launch_dir="$HOME/Library/LaunchAgents"
         mkdir -p "$launch_dir"
 
+        local runner_script_mac
+        case "${TUNNEL_MODE:-1}" in
+            2) runner_script_mac="$INSTALL_DIR/run_slipstream.sh" ;;
+            3) runner_script_mac="$INSTALL_DIR/run_both.sh" ;;
+            *) runner_script_mac="$INSTALL_DIR/run_dnstt.sh" ;;
+        esac
+
         cat > "$launch_dir/com.dnstt.runner.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1161,7 +1785,7 @@ EOF
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$INSTALL_DIR/run_dnstt.sh</string>
+        <string>${runner_script_mac}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$INSTALL_DIR</string>
@@ -1225,39 +1849,75 @@ print_summary() {
     echo -e "${GREEN}============================================================${NC}"
     echo ""
     echo -e "  Install dir  : ${CYAN}$INSTALL_DIR${NC}"
-    echo -e "  Binaries     : xray, dnstt-client, dnstt-dns-scanner"
     echo -e "  DNS file     : dns.txt (${DNS_COUNT:-?} entries)"
-    echo -e "  Instances    : $INSTANCE_COUNT (ports $START_PORT–$END_PORT)"
-    echo -e "  Domain       : $DNSTT_DOMAIN"
-    echo -e "  Pubkey       : ${DNSTT_PUBKEY:0:16}..."
-    if [ $USE_VLESS -eq 1 ]; then
+    echo -e "  Tunnel mode  : $([ "${TUNNEL_MODE:-1}" = "1" ] && echo "dnstt only" || ([ "${TUNNEL_MODE}" = "2" ] && echo "slipstream-rust only" || echo "Both (dnstt + slipstream-rust)"))"
+
+    case "${TUNNEL_MODE:-1}" in
+        1)
+            echo -e "  Binaries     : xray, dnstt-client, dnstt-dns-scanner"
+            echo -e "  dnstt domain : $DNSTT_DOMAIN"
+            echo -e "  dnstt pubkey : ${DNSTT_PUBKEY:0:16}..."
+            echo -e "  dnstt inst.  : $DNSTT_INSTANCE_COUNT (ports $DNSTT_START_PORT–$DNSTT_END_PORT)"
+            ;;
+        2)
+            echo -e "  Binaries     : xray, slipstream-client, dnstt-dns-scanner"
+            echo -e "  slip domain  : $SLIP_DOMAIN"
+            echo -e "  slip inst.   : $SLIP_INSTANCE_COUNT (ports $SLIP_START_PORT–$SLIP_END_PORT)"
+            echo -e "  scan domain  : $DNSTT_DOMAIN (dnstt, for scanner)"
+            echo -e "  scan pubkey  : ${DNSTT_PUBKEY:0:16}... (dnstt, for scanner)"
+            ;;
+        3)
+            echo -e "  Binaries     : xray, dnstt-client, slipstream-client, dnstt-dns-scanner"
+            echo -e "  dnstt domain : $DNSTT_DOMAIN"
+            echo -e "  dnstt pubkey : ${DNSTT_PUBKEY:0:16}..."
+            echo -e "  dnstt inst.  : $DNSTT_INSTANCE_COUNT (ports $DNSTT_START_PORT–$DNSTT_END_PORT)"
+            echo -e "  slip domain  : $SLIP_DOMAIN"
+            echo -e "  slip inst.   : $SLIP_INSTANCE_COUNT (ports $SLIP_START_PORT–$SLIP_END_PORT)"
+            ;;
+    esac
+    echo -e "  Total inst.  : $INSTANCE_COUNT (ports $START_PORT–$END_PORT)"
+
+    if [ "${USE_VLESS:-0}" -eq 1 ]; then
         echo -e "  VLESS port   : $VLESS_PORT"
         echo -e "  VLESS UUID   : $VLESS_UUID"
     fi
-    if [ $USE_MIXED -eq 1 ]; then
+    if [ "${USE_MIXED:-0}" -eq 1 ]; then
         echo -e "  Mixed port   : $MIXED_PORT"
     fi
     echo ""
     echo -e "  ${YELLOW}How it works:${NC}"
-    echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes,"
-    echo -e "       testing each one for a working DNSTT tunnel to your domain."
-    echo -e "    2. Servers with tunnels are ranked by latency and saved to ${CYAN}dns_with_tunnels.txt${NC}."
-    echo -e "       Servers that fail 10 consecutive scans are removed from the working list."
-    echo -e "    3. Every 20 scans, all IPs are restored from the original ${CYAN}dns.txt${NC} and failure"
-    echo -e "       counts are reset — giving previously-removed servers another chance."
-    echo -e "    4. ${CYAN}run_dnstt.sh${NC} distributes the best DNS servers across $INSTANCE_COUNT dnstt-client"
-    echo -e "       instances, health-checks them every 5 seconds, and restarts any that drop."
-    echo -e "    5. ${CYAN}xray${NC} load-balances your traffic across all live tunnels (strategy: ${XRAY_STRATEGY:-leastPing})."
+    echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes."
+    case "${TUNNEL_MODE:-1}" in
+        1)
+            echo -e "    2. Servers with working DNSTT tunnels are ranked and saved to ${CYAN}dns_with_tunnels.txt${NC}."
+            echo -e "    3. ${CYAN}run_dnstt.sh${NC} distributes the best DNS servers across $INSTANCE_COUNT dnstt-client instances."
+            ;;
+        2)
+            echo -e "    2. Reachable DNS servers are ranked by latency and saved to ${CYAN}slip_dns_with_tunnels.txt${NC}."
+            echo -e "    3. ${CYAN}run_slipstream.sh${NC} distributes DNS servers across $INSTANCE_COUNT slipstream-client instances."
+            ;;
+        3)
+            echo -e "    2. DNSTT-capable servers → ${CYAN}dns_with_tunnels.txt${NC}; reachable servers → ${CYAN}slip_dns_with_tunnels.txt${NC}."
+            echo -e "    3. ${CYAN}run_both.sh${NC} launches both dnstt ($DNSTT_INSTANCE_COUNT inst.) and slipstream ($SLIP_INSTANCE_COUNT inst.) runners."
+            ;;
+    esac
+    echo -e "    4. ${CYAN}xray${NC} load-balances your traffic across all live tunnels (strategy: ${XRAY_STRATEGY:-leastPing})."
     echo ""
     echo -e "  ${YELLOW}For now, please wait for the scanner to finish its first scan.${NC}"
+
+    local main_runner_script
+    case "${TUNNEL_MODE:-1}" in
+        2) main_runner_script="run_slipstream.sh" ;;
+        3) main_runner_script="run_both.sh" ;;
+        *) main_runner_script="run_dnstt.sh" ;;
+    esac
+
     echo -e "  You can watch progress with:"
     echo -e "    tail -f ${CYAN}$INSTALL_DIR/logs/dnstt-runner.log${NC}"
-    echo -e "  Tunnel results appear in:"
-    echo -e "    cat ${CYAN}$INSTALL_DIR/dns_with_tunnels.txt${NC}"
     echo ""
     echo -e "  To start manually:"
     echo -e "    cd ${CYAN}$INSTALL_DIR${NC}"
-    echo -e "    bash run_dnstt.sh &"
+    echo -e "    bash $main_runner_script &"
     echo -e "    ./xray run -c xray-config.json"
     echo ""
 
@@ -1322,10 +1982,13 @@ stop_running_instances_if_our_ports_in_use() {
         die "Aborted by user. Free the ports above or stop the processes and re-run."
     fi
 
-    info "Stopping run_dnstt, dnstt-client, and xray..."
-    pkill -f "run_dnstt.sh" 2>/dev/null || true
+    info "Stopping tunnel runners, dnstt-client, slipstream-client, and xray..."
+    pkill -f "run_dnstt.sh"      2>/dev/null || true
+    pkill -f "run_slipstream.sh" 2>/dev/null || true
+    pkill -f "run_both.sh"       2>/dev/null || true
     sleep 1
-    pkill -f "dnstt-client" 2>/dev/null || true
+    pkill -f "dnstt-client"      2>/dev/null || true
+    pkill -f "slipstream-client" 2>/dev/null || true
     pkill -x xray 2>/dev/null || pkill -f "xray run" 2>/dev/null || true
     sleep 1
     success "Processes stopped."
@@ -1337,7 +2000,7 @@ stop_running_instances_if_our_ports_in_use() {
 uninstall() {
     echo ""
     echo -e "${RED}============================================================${NC}"
-    echo -e "${RED}  dnstt + dnstt-dns-scanner + xray Uninstaller${NC}"
+    echo -e "${RED}  dnstt / slipstream-rust + dnstt-dns-scanner + xray Uninstaller${NC}"
     echo -e "${RED}============================================================${NC}"
     echo ""
 
@@ -1353,9 +2016,9 @@ uninstall() {
 
     echo ""
     warn "This will:"
-    echo "  - Stop all running dnstt-client, xray, and run_dnstt.sh processes"
+    echo "  - Stop all running dnstt-client, slipstream-client, xray, and runner processes"
     echo "  - Remove systemd/launchd services (if installed)"
-    echo "  - Remove run_dnstt-created data: logs/ and dns_* files (tools kept)"
+    echo "  - Remove runner-created data: logs/, dns_* and slip_* files (tools kept)"
     echo ""
     echo -e "${CYAN}Also remove all tools and the install directory? [y/N]:${NC} \c"
     read -r remove_tools
@@ -1368,9 +2031,12 @@ uninstall() {
     [[ "${confirm,,}" != "y" ]] && { info "Uninstall cancelled."; exit 0; }
 
     info "Stopping running processes..."
-    pkill -f "run_dnstt.sh" 2>/dev/null || true
+    pkill -f "run_dnstt.sh"      2>/dev/null || true
+    pkill -f "run_slipstream.sh" 2>/dev/null || true
+    pkill -f "run_both.sh"       2>/dev/null || true
     sleep 1
-    pkill -f "dnstt-client" 2>/dev/null || true
+    pkill -f "dnstt-client"      2>/dev/null || true
+    pkill -f "slipstream-client" 2>/dev/null || true
     pkill -x xray 2>/dev/null || pkill -f "xray run" 2>/dev/null || true
     sleep 1
 
@@ -1397,12 +2063,12 @@ uninstall() {
         fi
     done
 
-    # Remove run_dnstt-created data (logs and dns_* files)
+    # Remove runner-created data (logs, dns_* and slip_* files)
     if [ -d "$uninstall_dir/logs" ]; then
         info "Removing logs directory"
         rm -rf "$uninstall_dir/logs"
     fi
-    for f in "$uninstall_dir"/dns_*; do
+    for f in "$uninstall_dir"/dns_* "$uninstall_dir"/slip_*; do
         [ -e "$f" ] || continue
         info "Removing $f"
         rm -f "$f"
@@ -1411,13 +2077,16 @@ uninstall() {
         info "Removing _dns.txt"
         rm -f "$uninstall_dir/_dns.txt"
     fi
+    for f in run_dnstt.sh run_slipstream.sh run_both.sh; do
+        [ -f "$uninstall_dir/$f" ] && { info "Removing $f"; rm -f "$uninstall_dir/$f"; }
+    done
 
     if [ "$do_remove_tools" = true ]; then
         info "Removing install directory: $uninstall_dir"
         rm -rf "$uninstall_dir"
         success "Uninstall complete (tools and directory removed)."
     else
-        success "Uninstall complete (run_dnstt data removed; tools kept in $uninstall_dir)."
+        success "Uninstall complete (runner data removed; tools kept in $uninstall_dir)."
     fi
     echo ""
 }
@@ -1427,7 +2096,7 @@ uninstall() {
 # ---------------------------------------------------------------------------
 echo ""
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}  dnstt + dnstt-dns-scanner + xray Installer${NC}"
+echo -e "${GREEN}  dnstt / slipstream-rust + dnstt-dns-scanner + xray Installer${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo "  1) Install"
@@ -1443,13 +2112,34 @@ fi
 detect_platform
 ask_install_dir
 check_deps
+ask_tunnel_mode
 download_tools
 ask_resolvers
-ask_dnstt_settings
+
+# Ask settings based on tunnel mode
+case "${TUNNEL_MODE:-1}" in
+    1)
+        ask_dnstt_settings
+        DNSTT_INSTANCE_COUNT="${DNSTT_INSTANCE_COUNT:-25}"
+        DNSTT_START_PORT="${DNSTT_START_PORT:-7001}"
+        DNSTT_END_PORT="${DNSTT_END_PORT:-$((DNSTT_START_PORT + DNSTT_INSTANCE_COUNT - 1))}"
+        ;;
+    2)
+        # Dummy dnstt vars so set_port_range doesn't fail
+        DNSTT_INSTANCE_COUNT=0; DNSTT_START_PORT=7001; DNSTT_END_PORT=7000
+        ask_slipstream_settings
+        ;;
+    3)
+        ask_dnstt_settings
+        ask_slipstream_settings
+        ;;
+esac
+
+set_port_range
 ask_xray_settings
 stop_running_instances_if_our_ports_in_use
 generate_xray_config
-generate_run_dnstt
+generate_runner_scripts
 install_service
 print_summary
 
