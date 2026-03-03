@@ -720,25 +720,6 @@ refill_dns_file() {
     return 0
 }
 
-# Function to convert latency to a sortable numeric value (milliseconds)
-latency_to_sortable() {
-    local latency_str="\$1"
-    latency_str=\$(echo "\$latency_str" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
-
-    if [[ "\$latency_str" =~ ([0-9.]+)(µs|ms|s) ]]; then
-        local value="\${BASH_REMATCH[1]}"
-        local unit="\${BASH_REMATCH[2]}"
-
-        case "\$unit" in
-            µs) echo "\$value" | awk '{printf "%.10f", \$1/1000}' ;;
-            ms) echo "\$value" ;;
-            s)  echo "\$value" | awk '{printf "%.10f", \$1*1000}' ;;
-        esac
-    else
-        echo "999999.0"
-    fi
-}
-
 # Function to scan DNS servers and get all with tunnels
 scan_and_get_all_dns() {
     local DNS_WITH_TUNNELS_FILE="dns_with_tunnels.txt"
@@ -785,108 +766,76 @@ scan_and_get_all_dns() {
         echo "Using -quick mode (DNS > 512) to speed up scan; skip aggressive tests."
     fi
 
-    local scanner_output
-    local scanner_exit_code
+    local scanner_out_file=\$(mktemp)
     local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads\${quick_arg} \$DOMAIN"
 
     echo "Executing command: \$scanner_cmd"
-    echo "--- Scanner output ---"
-    scanner_output=\$(eval "\$scanner_cmd" 2>&1)
-    scanner_exit_code=\$?
+    eval "\$scanner_cmd" > "\$scanner_out_file" 2>&1
+    local scanner_exit_code=\$?
     echo "Scanner exit code: \$scanner_exit_code"
+    cat "\$scanner_out_file"
     if [ \$scanner_exit_code -ne 0 ]; then
-        echo "--- Full scanner output (stderr/stdout) ---"
-        echo "\$scanner_output"
-        echo "--- End scanner output ---"
         echo "ERROR: Scanner failed with exit code \$scanner_exit_code"
+        rm -f "\$scanner_out_file"
         return 1
     fi
 
-    echo "--- Scanner output ---"
-    echo "\$scanner_output"
-    echo "--- End scanner output ---"
+    # Extract the already-sorted IPs from the "Tunnel-capable DNS servers IPs:" section in one awk pass
+    echo "--- Parsing tunnel-capable IPs from scanner output ---"
+    awk '/^Tunnel-capable DNS servers IPs:/{found=1; next} found && /^[0-9]/{print} found && !/^[0-9]/{exit}' \
+        "\$scanner_out_file" > "\$DNS_WITH_TUNNELS_FILE"
+    local tunnel_count=\$(wc -l < "\$DNS_WITH_TUNNELS_FILE" | tr -d ' ')
+    echo "Found \$tunnel_count tunnel-capable DNS servers"
 
-    echo "--- Parsing scanner output for TUNNEL servers ---"
-    local temp_file=\$(mktemp)
-    local tunnel_count=0
-    local dns_with_tunnels=()
-
-    local scanned_dns=()
-    while IFS= read -r ip; do
-        [ -n "\$ip" ] && scanned_dns+=("\$ip")
-    done < "\$_DNS_FILE"
-
-    while IFS= read -r line; do
-        if echo "\$line" | grep -q "TUNNEL"; then
-            echo "Found TUNNEL line: \$line"
-            tunnel_count=\$((tunnel_count + 1))
-            local ip=\$(echo "\$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -n1)
-            local latency=\$(echo "\$line" | sed -n 's/.*latency:[[:space:]]*\([^)]*\).*/\1/p')
-            echo "  Extracted IP: '\$ip', Latency: '\$latency'"
-            if [ -n "\$ip" ] && [ -n "\$latency" ]; then
-                local latency_sortable=\$(latency_to_sortable "\$latency")
-                echo "  Latency sortable value: \$latency_sortable"
-                echo "\$latency_sortable|\$ip" >> "\$temp_file"
-                dns_with_tunnels+=("\$ip")
-            else
-                echo "  WARNING: Failed to extract IP or latency from line"
-            fi
-        fi
-    done <<< "\$scanner_output"
-
-    echo "Found \$tunnel_count lines with TUNNEL tag"
-
+    # Update failure tracking in one awk pass (O(N) instead of O(N²) nested loops)
     echo "--- Updating failure tracking ---"
-    # Quick scan: each failure counts as 5 so we remove bad IPs faster
     local fail_inc=1
-    if [ -n "\$quick_arg" ]; then fail_inc=5; fi
-
+    [ -n "\$quick_arg" ] && fail_inc=5
     local new_failures_file=\$(mktemp)
+    local new_dns_file=\$(mktemp)
 
-    for scanned_ip in "\${scanned_dns[@]}"; do
-        local has_tunnel=0
-        for tunnel_ip in "\${dns_with_tunnels[@]}"; do
-            if [ "\$scanned_ip" = "\$tunnel_ip" ]; then has_tunnel=1; break; fi
-        done
-
-        local current_count=0
-        if [ -f "\$DNS_FAILURES_FILE" ]; then
-            local existing_count=\$(grep "^\${scanned_ip}|" "\$DNS_FAILURES_FILE" | cut -d'|' -f2)
-            if [ -n "\$existing_count" ]; then current_count=\$existing_count; fi
-        fi
-
-        if [ \$has_tunnel -eq 1 ]; then
-            echo "DNS \$scanned_ip: Has tunnel, resetting failure count"
-        else
-            current_count=\$((current_count + fail_inc))
-            echo "DNS \$scanned_ip: No tunnel, failure count: \$current_count"
-            echo "\${scanned_ip}|\${current_count}" >> "\$new_failures_file"
-            if [ \$current_count -ge 10 ]; then
-                echo "DNS \$scanned_ip: Removed from \$_DNS_FILE (10 consecutive failures)"
-                local temp_dns_file=\$(mktemp)
-                grep -v "^\${scanned_ip}\$" "\$_DNS_FILE" > "\$temp_dns_file"
-                mv "\$temp_dns_file" "\$_DNS_FILE"
-            fi
-        fi
-    done
+    awk -v fail_inc="\$fail_inc" -v failures_file="\$DNS_FAILURES_FILE" \
+        -v dns_file="\$_DNS_FILE" -v new_dns_file="\$new_dns_file" '
+    BEGIN {
+        while ((getline line < failures_file) > 0) {
+            n = split(line, a, "|")
+            if (n == 2) fail_count[a[1]] = a[2]+0
+        }
+        close(failures_file)
+        while ((getline ip < dns_file) > 0) {
+            if (ip != "") scanned[ip] = 1
+        }
+        close(dns_file)
+    }
+    { is_tunnel[\$1] = 1 }
+    END {
+        for (ip in scanned) {
+            if (ip in is_tunnel) {
+                printf "DNS %s: Has tunnel, resetting failure count\n", ip > "/dev/stderr"
+            } else {
+                cnt = (ip in fail_count ? fail_count[ip] : 0) + fail_inc
+                printf "%s|%d\n", ip, cnt
+                printf "DNS %s: No tunnel, failure count: %d\n", ip, cnt > "/dev/stderr"
+                if (cnt < 10) print ip > new_dns_file
+                else printf "DNS %s: Removed from _dns.txt (10 consecutive failures)\n", ip > "/dev/stderr"
+            }
+        }
+    }
+    ' "\$DNS_WITH_TUNNELS_FILE" > "\$new_failures_file"
 
     mv "\$new_failures_file" "\$DNS_FAILURES_FILE"
+    # Tunnel IPs always stay in _dns.txt (append them to the surviving-failures list)
+    cat "\$DNS_WITH_TUNNELS_FILE" >> "\$new_dns_file"
+    sort -u "\$new_dns_file" -o "\$new_dns_file"
+    mv "\$new_dns_file" "\$_DNS_FILE"
 
-    if [ -s "\$temp_file" ]; then
-        echo "--- Sorting DNS servers by latency ---"
-        cat "\$temp_file" | while IFS='|' read latency ip; do echo "  \$ip: \$latency ms"; done
-        sort -t'|' -k1 -n "\$temp_file" > "\${temp_file}.sorted"
-        mv "\${temp_file}.sorted" "\$temp_file"
-        echo "--- Sorted list ---"
-        cat "\$temp_file" | while IFS='|' read latency ip; do echo "  \$ip: \$latency ms"; done
-        cut -d'|' -f2 "\$temp_file" > "\$DNS_WITH_TUNNELS_FILE"
-        echo "=== Saved \$(wc -l < "\$DNS_WITH_TUNNELS_FILE") DNS servers with tunnels to \$DNS_WITH_TUNNELS_FILE ==="
-        rm -f "\$temp_file"
+    rm -f "\$scanner_out_file"
+
+    if [ "\$tunnel_count" -gt 0 ]; then
+        echo "=== Saved \$tunnel_count DNS servers with tunnels to \$DNS_WITH_TUNNELS_FILE ==="
         return 0
     else
-        echo "ERROR: No DNS servers with TUNNEL tag found in scanner output!"
-        echo "Tunnel count: \$tunnel_count"
-        rm -f "\$temp_file"
+        echo "ERROR: No tunnel-capable DNS servers found in scanner output!"
         > "\$DNS_WITH_TUNNELS_FILE"
         return 1
     fi
@@ -1322,23 +1271,6 @@ refill_dns_file() {
     return 0
 }
 
-# Function to convert latency to a sortable numeric value (milliseconds)
-latency_to_sortable() {
-    local latency_str="\$1"
-    latency_str=\$(echo "\$latency_str" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
-    if [[ "\$latency_str" =~ ([0-9.]+)(µs|ms|s) ]]; then
-        local value="\${BASH_REMATCH[1]}"
-        local unit="\${BASH_REMATCH[2]}"
-        case "\$unit" in
-            µs) echo "\$value" | awk '{printf "%.10f", \$1/1000}' ;;
-            ms) echo "\$value" ;;
-            s)  echo "\$value" | awk '{printf "%.10f", \$1*1000}' ;;
-        esac
-    else
-        echo "999999.0"
-    fi
-}
-
 # Scan DNS servers using dnstt-dns-scanner and collect those with tunnels
 scan_and_get_all_dns() {
     local DNS_WITH_TUNNELS_FILE="slip_dns_with_tunnels.txt"
@@ -1372,66 +1304,68 @@ scan_and_get_all_dns() {
     [ \$dns_count -gt 512 ] && quick_arg=" -quick"
 
     # Use the dnstt server credentials to scan — slipstream needs reachable DNS servers
-    local scanner_output
-    scanner_output=\$(./dnstt-dns-scanner -ips "\$_DNS_FILE" -pubkey "\$SCANNER_PUBKEY" \
-        -test-domain test.k.markop.ir -test-txt "TEST RESULT" -threads "\$threads"\${quick_arg} "\$SCANNER_DOMAIN" 2>&1 || true)
+    local scanner_out_file=\$(mktemp)
+    ./dnstt-dns-scanner -ips "\$_DNS_FILE" -pubkey "\$SCANNER_PUBKEY" \
+        -test-domain test.k.markop.ir -test-txt "TEST RESULT" -threads "\$threads"\${quick_arg} "\$SCANNER_DOMAIN" \
+        > "\$scanner_out_file" 2>&1 || true
+    cat "\$scanner_out_file"
 
-    echo "\$scanner_output"
+    # Extract the already-sorted IPs from the "Tunnel-capable DNS servers IPs:" section in one awk pass
+    echo "--- Parsing tunnel-capable IPs from scanner output ---"
+    awk '/^Tunnel-capable DNS servers IPs:/{found=1; next} found && /^[0-9]/{print} found && !/^[0-9]/{exit}' \
+        "\$scanner_out_file" > "\$DNS_WITH_TUNNELS_FILE"
+    local tunnel_count=\$(wc -l < "\$DNS_WITH_TUNNELS_FILE" | tr -d ' ')
+    echo "Found \$tunnel_count working DNS servers"
 
-    local temp_file=\$(mktemp)
-    local dns_with_tunnels=()
-    local scanned_dns=()
-    while IFS= read -r ip; do [ -n "\$ip" ] && scanned_dns+=("\$ip"); done < "\$_DNS_FILE"
-
-    while IFS= read -r line; do
-        # Accept any working DNS (EDNS or DNSTT tag) — slipstream doesn't need dnstt tunnel
-        if echo "\$line" | grep -qE '✓'; then
-            local ip=\$(echo "\$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -n1)
-            local latency=\$(echo "\$line" | sed -n 's/.*latency:[[:space:]]*\([^)]*\).*/\1/p')
-            if [ -n "\$ip" ] && [ -n "\$latency" ]; then
-                local latency_sortable=\$(latency_to_sortable "\$latency")
-                echo "\$latency_sortable|\$ip" >> "\$temp_file"
-                dns_with_tunnels+=("\$ip")
-            fi
-        fi
-    done <<< "\$scanner_output"
-
-    # Update failure tracking
+    # Update failure tracking in one awk pass (O(N) instead of O(N²) nested loops)
+    echo "--- Updating failure tracking ---"
     local fail_inc=1
     [ -n "\$quick_arg" ] && fail_inc=5
     local new_failures_file=\$(mktemp)
+    local new_dns_file=\$(mktemp)
 
-    for scanned_ip in "\${scanned_dns[@]}"; do
-        local has_tunnel=0
-        for tunnel_ip in "\${dns_with_tunnels[@]}"; do
-            [ "\$scanned_ip" = "\$tunnel_ip" ] && { has_tunnel=1; break; }
-        done
-        local current_count=0
-        if [ -f "\$DNS_FAILURES_FILE" ]; then
-            local existing_count=\$(grep "^\${scanned_ip}|" "\$DNS_FAILURES_FILE" | cut -d'|' -f2)
-            [ -n "\$existing_count" ] && current_count=\$existing_count
-        fi
-        if [ \$has_tunnel -eq 0 ]; then
-            current_count=\$((current_count + fail_inc))
-            echo "\${scanned_ip}|\${current_count}" >> "\$new_failures_file"
-            if [ \$current_count -ge 10 ]; then
-                echo "DNS \$scanned_ip: Removed from \$_DNS_FILE (10 consecutive failures)"
-                local temp_dns_file=\$(mktemp)
-                grep -v "^\${scanned_ip}\$" "\$_DNS_FILE" > "\$temp_dns_file"
-                mv "\$temp_dns_file" "\$_DNS_FILE"
-            fi
-        fi
-    done
+    awk -v fail_inc="\$fail_inc" -v failures_file="\$DNS_FAILURES_FILE" \
+        -v dns_file="\$_DNS_FILE" -v new_dns_file="\$new_dns_file" '
+    BEGIN {
+        while ((getline line < failures_file) > 0) {
+            n = split(line, a, "|")
+            if (n == 2) fail_count[a[1]] = a[2]+0
+        }
+        close(failures_file)
+        while ((getline ip < dns_file) > 0) {
+            if (ip != "") scanned[ip] = 1
+        }
+        close(dns_file)
+    }
+    { is_tunnel[\$1] = 1 }
+    END {
+        for (ip in scanned) {
+            if (ip in is_tunnel) {
+                printf "DNS %s: Has tunnel, resetting failure count\n", ip > "/dev/stderr"
+            } else {
+                cnt = (ip in fail_count ? fail_count[ip] : 0) + fail_inc
+                printf "%s|%d\n", ip, cnt
+                printf "DNS %s: No tunnel, failure count: %d\n", ip, cnt > "/dev/stderr"
+                if (cnt < 10) print ip > new_dns_file
+                else printf "DNS %s: Removed from _dns.txt (10 consecutive failures)\n", ip > "/dev/stderr"
+            }
+        }
+    }
+    ' "\$DNS_WITH_TUNNELS_FILE" > "\$new_failures_file"
+
     mv "\$new_failures_file" "\$DNS_FAILURES_FILE"
+    # Tunnel IPs always stay in _dns.txt (append them to the surviving-failures list)
+    cat "\$DNS_WITH_TUNNELS_FILE" >> "\$new_dns_file"
+    sort -u "\$new_dns_file" -o "\$new_dns_file"
+    mv "\$new_dns_file" "\$_DNS_FILE"
 
-    if [ -s "\$temp_file" ]; then
-        sort -t'|' -k1 -n "\$temp_file" | cut -d'|' -f2 > "\$DNS_WITH_TUNNELS_FILE"
-        echo "=== Saved \$(wc -l < "\$DNS_WITH_TUNNELS_FILE") working DNS servers to \$DNS_WITH_TUNNELS_FILE ==="
-        rm -f "\$temp_file"
+    rm -f "\$scanner_out_file"
+
+    if [ "\$tunnel_count" -gt 0 ]; then
+        echo "=== Saved \$tunnel_count working DNS servers to \$DNS_WITH_TUNNELS_FILE ==="
         return 0
     else
         echo "ERROR: No working DNS servers found!"
-        rm -f "\$temp_file"
         > "\$DNS_WITH_TUNNELS_FILE"
         return 1
     fi
