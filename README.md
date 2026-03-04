@@ -105,7 +105,7 @@ The `-ips` flag accepts:
 | `-output FILE` | Save results to file (plain IP list, sorted by latency) | ❌ No |
 | `-test-domain DOMAIN` | Custom domain to query for DNS server test | ❌ No |
 | `-test-txt VALUE` | Expected TXT record value to verify DNS server works correctly | ❌ No |
-| `-quick` | Skip advanced tunnel tests (only perform basic connectivity test) | ❌ No |
+| `-full-test` | Perform complete tunnel tests including bidirectional communication | ❌ No |
 | `-tunnel-only` | Show only DNS servers with full tunnel support in live output | ❌ No |
 
 ### Examples
@@ -155,11 +155,11 @@ The `-ips` flag accepts:
                      t.example.com
 ```
 
-**Quick scan (basic connectivity only, faster):**
+**Full test (complete bidirectional tunnel verification):**
 ```bash
 ./dnstt-dns-scanner -ips 10.10.0.0/16 \
                      -pubkey-file server.pub \
-                     -quick \
+                     -full-test \
                      t.example.com
 ```
 
@@ -193,14 +193,14 @@ The scanner performs a comprehensive three-stage test for each DNS server:
 
 ### Test Modes
 
-**Full Mode (default):** Performs all tunnel tests including:
+**Basic Mode (default):** Performs the initial connectivity test only — fast and suitable for large scans.
+
+**Full Test Mode (`-full-test` flag):** Performs all tunnel tests including:
 - Basic connectivity test (single HTTP request)
 - Multiple concurrent streams test
 - Sustained data transfer test
 - Multiple streams stability test
 - **Bidirectional communication test** (8 request/response cycles to catch DNS resolvers that stop mid-connection)
-
-**Quick Mode (`-quick` flag):** Only performs the basic connectivity test. This is faster but may miss DNS resolvers that work initially but fail under sustained use (like SSH authentication failures). Use quick mode for initial scanning, then verify promising servers with full mode.
 
 ## Output
 
@@ -220,15 +220,6 @@ Tunnel-capable DNS servers:
 Tunnel-capable DNS servers IPs:
 1.1.1.1
 8.8.8.8
-```
-
-With `-quick` the detail section shows only the basic test latency:
-```
-Tunnel-capable DNS servers:
-  1.1.1.1 (latency: 8ms) [basic: 8ms]
----
-Tunnel-capable DNS servers IPs:
-1.1.1.1
 ```
 
 ### Status Tags

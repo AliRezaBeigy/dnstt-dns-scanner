@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-03-04
+
+### Changed
+- Default scan mode is now basic (single connectivity test), making large scans faster out of the box
+- Replaced `-quick` flag with `-full-test` flag (inverted logic): pass `-full-test` to run the complete tunnel test suite including bidirectional communication
+
+### Removed
+- `-quick` flag
+
 ## [1.2.1] - 2026-03-02
 
 ### Changed
@@ -31,7 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.0] - 2026-01-23
 
 ### Added
-- `-quick` flag to skip advanced tunnel tests and only perform basic connectivity test
 - Extended full tunnel test suite with multiple concurrent stream tests
 - 2 KB sustained data transfer test to verify throughput
 - Multiple stream stability test (3 rapid streams)
@@ -57,7 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `-verbose` flag to show failed servers on stderr
 - Graceful Ctrl+C interruption with partial results
 
-[Unreleased]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/AliRezaBeigy/dnstt-dns-scanner/compare/v1.0.0...v1.1.0

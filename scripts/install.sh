@@ -846,15 +846,8 @@ scan_and_get_all_dns() {
     [ \$threads -lt 1 ] && threads=1
     echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
 
-    # When scanning more than 512 DNS, use -quick to skip aggressive tests for speed (do not use quick to find a really good DNS)
-    local quick_arg=""
-    if [ \$dns_count -gt 512 ]; then
-        quick_arg=" -quick"
-        echo "Using -quick mode (DNS > 512) to speed up scan; skip aggressive tests."
-    fi
-
     local scanner_out_file=\$(mktemp)
-    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads\${quick_arg} \$DOMAIN"
+    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads \$DOMAIN"
 
     echo "Executing command: \$scanner_cmd"
     eval "\$scanner_cmd" > "\$scanner_out_file" 2>&1
@@ -877,7 +870,7 @@ scan_and_get_all_dns() {
     # Update failure tracking in one awk pass (O(N) instead of O(N²) nested loops)
     echo "--- Updating failure tracking ---"
     local fail_inc=1
-    [ -n "\$quick_arg" ] && fail_inc=5
+
     local new_failures_file=\$(mktemp)
     local new_dns_file=\$(mktemp)
 
@@ -1397,14 +1390,8 @@ scan_and_get_all_dns() {
     [ \$threads -lt 1 ] && threads=1
     echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
 
-    local quick_arg=""
-    if [ \$dns_count -gt 512 ]; then
-        quick_arg=" -quick"
-        echo "Using -quick mode (DNS > 512) to speed up scan."
-    fi
-
     local scanner_out_file=\$(mktemp)
-    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$SCANNER_PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads\${quick_arg} \$SCANNER_DOMAIN"
+    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$SCANNER_PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads \$SCANNER_DOMAIN"
 
     echo "Executing command: \$scanner_cmd"
     eval "\$scanner_cmd" > "\$scanner_out_file" 2>&1
@@ -1425,7 +1412,7 @@ scan_and_get_all_dns() {
 
     echo "--- Updating failure tracking ---"
     local fail_inc=1
-    [ -n "\$quick_arg" ] && fail_inc=5
+
     local new_failures_file=\$(mktemp)
     local new_dns_file=\$(mktemp)
 
@@ -1898,13 +1885,10 @@ scan_and_get_all_dns() {
     [ \$threads -lt 1 ] && threads=1
     echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
 
-    local quick_arg=""
-    [ \$dns_count -gt 512 ] && quick_arg=" -quick"
-
     # Use the dnstt server credentials to scan — slipstream needs reachable DNS servers
     local scanner_out_file=\$(mktemp)
     ./dnstt-dns-scanner -ips "\$_DNS_FILE" -pubkey "\$SCANNER_PUBKEY" \
-        -test-domain test.k.markop.ir -test-txt "TEST RESULT" -threads "\$threads"\${quick_arg} "\$SCANNER_DOMAIN" \
+        -test-domain test.k.markop.ir -test-txt "TEST RESULT" -threads "\$threads" "\$SCANNER_DOMAIN" \
         > "\$scanner_out_file" 2>&1 || true
     cat "\$scanner_out_file"
 
@@ -1918,7 +1902,7 @@ scan_and_get_all_dns() {
     # Update failure tracking in one awk pass (O(N) instead of O(N²) nested loops)
     echo "--- Updating failure tracking ---"
     local fail_inc=1
-    [ -n "\$quick_arg" ] && fail_inc=5
+
     local new_failures_file=\$(mktemp)
     local new_dns_file=\$(mktemp)
 

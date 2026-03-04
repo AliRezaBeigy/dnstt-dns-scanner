@@ -449,7 +449,7 @@ func (c *ScannerDNSPacketConn) Close() error {
 }
 
 // testDNSTTEncoding tests the full protocol stack: DNS -> KCP -> Noise -> smux -> SOCKS5.
-func testDNSTTEncoding(ctx context.Context, ip string, domain dns.Name, pubkey []byte, timeout time.Duration, quick bool) (bool, bool, time.Duration, testLatencies, error) {
+func testDNSTTEncoding(ctx context.Context, ip string, domain dns.Name, pubkey []byte, timeout time.Duration, fullTest bool) (bool, bool, time.Duration, testLatencies, error) {
 	startTime := time.Now()
 	var lat testLatencies
 
@@ -528,7 +528,7 @@ func testDNSTTEncoding(ctx context.Context, ip string, domain dns.Name, pubkey [
 		return true, false, time.Since(startTime), lat, fmt.Errorf("first HTTP request failed: %v", err)
 	}
 
-	if quick {
+	if !fullTest {
 		return true, true, time.Since(startTime), lat, nil
 	}
 
@@ -906,7 +906,7 @@ func testBidirectionalCommunication(sess *smux.Session, timeout time.Duration) e
 	return nil
 }
 
-func scanIP(ctx context.Context, ip string, domain dns.Name, pubkey []byte, timeout time.Duration, testDomain dns.Name, expectedTXT string, quick bool, results chan<- scanResult) {
+func scanIP(ctx context.Context, ip string, domain dns.Name, pubkey []byte, timeout time.Duration, testDomain dns.Name, expectedTXT string, fullTest bool, results chan<- scanResult) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -927,7 +927,7 @@ func scanIP(ctx context.Context, ip string, domain dns.Name, pubkey []byte, time
 		if ctx.Err() != nil {
 			return
 		}
-		dnsttWorking, hasTunnelResp, dnsttLatency, dnsttLat, dnsttErr := testDNSTTEncoding(ctx, ip, domain, pubkey, timeout, quick)
+		dnsttWorking, hasTunnelResp, dnsttLatency, dnsttLat, dnsttErr := testDNSTTEncoding(ctx, ip, domain, pubkey, timeout, fullTest)
 		result.dnsttCompatible = dnsttWorking
 		result.hasTunnelResponse = hasTunnelResp
 		if !dnsttWorking {
@@ -1059,12 +1059,12 @@ func main() {
 	var verbose bool
 	var testDomainStr string
 	var expectedTXT string
-	var quick bool
+	var fullTest bool
 	var tunnelOnly bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s -ips IP_OR_CIDR_OR_FILE (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN [-threads N] [-timeout DURATION] [-verbose] [-output FILE] [-quick] [-tunnel-only]
+  %[1]s -ips IP_OR_CIDR_OR_FILE (-pubkey PUBKEY|-pubkey-file PUBKEYFILE) DOMAIN [-threads N] [-timeout DURATION] [-verbose] [-output FILE] [-full-test] [-tunnel-only]
 
 The -ips flag accepts:
   - CIDR notation (e.g., 192.168.1.0/24)
@@ -1076,7 +1076,7 @@ Examples:
   %[1]s -ips 192.168.1.1 -pubkey-file server.pub t.example.com
   %[1]s -ips ip-list.txt -pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff t.example.com -output results.txt
   %[1]s -ips 10.10.0.0/24 -pubkey-file server.pub t.example.com -test-domain test.k.markop.ir -test-txt "TEST RESULT"
-  %[1]s -ips 10.10.0.0/16 -pubkey-file server.pub t.example.com -quick
+  %[1]s -ips 10.10.0.0/16 -pubkey-file server.pub t.example.com -full-test
 
 Options:
 `, os.Args[0])
@@ -1093,7 +1093,7 @@ Options:
 	flag.StringVar(&outputFile, "output", "", "save results to file (default: stdout only)")
 	flag.StringVar(&testDomainStr, "test-domain", "", "custom domain to query for DNS server test (e.g., test.k.markop.ir)")
 	flag.StringVar(&expectedTXT, "test-txt", "", "expected TXT record value to verify DNS server works correctly")
-	flag.BoolVar(&quick, "quick", false, "skip advanced tunnel tests (only perform basic connectivity test)")
+	flag.BoolVar(&fullTest, "full-test", false, "perform complete tunnel tests including bidirectional communication")
 	flag.BoolVar(&tunnelOnly, "tunnel-only", false, "show only DNS servers with full tunnel support in live output")
 	flag.Parse()
 
@@ -1165,10 +1165,10 @@ Options:
 	totalIPs := len(ips)
 	fmt.Fprintf(os.Stderr, "Scanning %d IPs from %s with %d threads (timeout: %v)...\n", totalIPs, ipsInput, threads, timeout)
 	fmt.Fprintf(os.Stderr, "Domain: %s\n", flag.Arg(0))
-	if quick {
-		fmt.Fprintf(os.Stderr, "Mode: Quick (basic connectivity test only)\n")
-	} else {
+	if fullTest {
 		fmt.Fprintf(os.Stderr, "Mode: Full (all tunnel tests including bidirectional communication)\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Mode: Basic (basic connectivity test only)\n")
 	}
 	if testDomainStr != "" {
 		fmt.Fprintf(os.Stderr, "Test domain: %s\n", testDomainStr)
@@ -1203,7 +1203,7 @@ Options:
 					if !ok {
 						return
 					}
-					scanIP(ctx, ip, domain, pubkey, timeout, testDomain, expectedTXT, quick, results)
+					scanIP(ctx, ip, domain, pubkey, timeout, testDomain, expectedTXT, fullTest, results)
 				}
 			}
 		}()
