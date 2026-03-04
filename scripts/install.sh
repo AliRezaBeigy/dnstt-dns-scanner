@@ -272,11 +272,23 @@ get_dnstt_defaults_from_script() {
     [ ! -f "$script_path" ] && return
     default_domain=""
     default_pubkey=""
+    default_dnstt_mode=""
+    default_ssh_user=""
+    default_scanner_domain=""
+    default_scanner_pubkey=""
     while IFS= read -r line; do
         if [[ "$line" =~ ^DOMAIN=\"(.*)\" ]]; then
             default_domain="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^PUBKEY=\"(.*)\" ]]; then
             default_pubkey="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^DNSTT_MODE=\"(.*)\" ]]; then
+            default_dnstt_mode="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^SSH_USER=\"(.*)\" ]]; then
+            default_ssh_user="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^SCANNER_DOMAIN=\"(.*)\" ]]; then
+            default_scanner_domain="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^SCANNER_PUBKEY=\"(.*)\" ]]; then
+            default_scanner_pubkey="${BASH_REMATCH[1]}"
         fi
     done < "$script_path" 2>/dev/null
 }
@@ -287,6 +299,10 @@ ask_dnstt_settings() {
 
     default_domain=""
     default_pubkey=""
+    default_dnstt_mode=""
+    default_ssh_user=""
+    default_scanner_domain=""
+    default_scanner_pubkey=""
     get_dnstt_defaults_from_script "$INSTALL_DIR/run_dnstt.sh"
 
     if [ -n "$default_domain" ]; then
@@ -307,6 +323,69 @@ ask_dnstt_settings() {
     read -r DNSTT_PUBKEY
     DNSTT_PUBKEY="${DNSTT_PUBKEY:-$default_pubkey}"
     [ -z "$DNSTT_PUBKEY" ] && die "Pubkey cannot be empty."
+
+    echo ""
+    echo "  dnstt connection mode:"
+    echo "  1) SOCKS5 (default) — dnstt-client listens locally as SOCKS5 proxy"
+    echo "  2) SSH (-D) — SSH connects to dnstt SOCKS5, dynamic forwarding to xray"
+    if [ -n "$default_dnstt_mode" ]; then
+        local mode_display; [ "$default_dnstt_mode" = "ssh" ] && mode_display="2" || mode_display="1"
+        echo -e "${CYAN}Enter your choice [default: $mode_display]:${NC} \c"
+    else
+        echo -e "${CYAN}Enter your choice [default: 1]:${NC} \c"
+    fi
+    read -r dnstt_mode_choice
+    local default_mode_val; [ "$default_dnstt_mode" = "ssh" ] && default_mode_val="2" || default_mode_val="1"
+    dnstt_mode_choice="${dnstt_mode_choice:-$default_mode_val}"
+
+    case "$dnstt_mode_choice" in
+        2)
+            DNSTT_MODE="ssh"
+
+            echo -e "${YELLOW}[INFO]${NC} SSH mode: dnstt-client runs as SOCKS5 on localhost; SSH connects to it with -D (dynamic forwarding) and xray uses SSH as SOCKS5."
+            echo ""
+
+            if [ -n "$default_ssh_user" ]; then
+                echo -e "${CYAN}Enter SSH username [default: $default_ssh_user]:${NC} \c"
+            else
+                echo -e "${CYAN}Enter SSH username:${NC} \c"
+            fi
+            read -r DNSTT_SSH_USER
+            DNSTT_SSH_USER="${DNSTT_SSH_USER:-$default_ssh_user}"
+            [ -z "$DNSTT_SSH_USER" ] && die "SSH username cannot be empty."
+
+            echo -e "${CYAN}Enter SSH password:${NC} \c"
+            read -rs DNSTT_SSH_PASS; echo
+            [ -z "$DNSTT_SSH_PASS" ] && die "SSH password cannot be empty."
+
+            echo ""
+            echo -e "${YELLOW}[INFO]${NC} SSH mode: the scanner needs separate dnstt SOCKS5 credentials to verify DNS tunnels."
+            if [ -n "$default_scanner_domain" ]; then
+                echo -e "${CYAN}Enter dnstt domain for scanner [default: $default_scanner_domain]:${NC} \c"
+            else
+                echo -e "${CYAN}Enter dnstt domain for scanner:${NC} \c"
+            fi
+            read -r DNSTT_SCANNER_DOMAIN
+            DNSTT_SCANNER_DOMAIN="${DNSTT_SCANNER_DOMAIN:-$default_scanner_domain}"
+            [ -z "$DNSTT_SCANNER_DOMAIN" ] && die "Scanner domain cannot be empty."
+
+            if [ -n "$default_scanner_pubkey" ]; then
+                local sp_preview="${default_scanner_pubkey:0:20}..."
+                echo -e "${CYAN}Enter dnstt pubkey for scanner [default: $sp_preview]:${NC} \c"
+            else
+                echo -e "${CYAN}Enter dnstt pubkey for scanner:${NC} \c"
+            fi
+            read -r DNSTT_SCANNER_PUBKEY
+            DNSTT_SCANNER_PUBKEY="${DNSTT_SCANNER_PUBKEY:-$default_scanner_pubkey}"
+            [ -z "$DNSTT_SCANNER_PUBKEY" ] && die "Scanner pubkey cannot be empty."
+
+            success "SSH -D mode configured."
+            ;;
+        *)
+            DNSTT_MODE="socks5"
+            success "SOCKS5 mode selected."
+            ;;
+    esac
 
     while true; do
         if [ "${TUNNEL_MODE:-1}" = "3" ]; then
@@ -660,7 +739,15 @@ generate_runner_scripts() {
 }
 
 generate_run_dnstt() {
-    info "Generating run_dnstt.sh..."
+    if [ "${DNSTT_MODE:-socks5}" = "ssh" ]; then
+        generate_run_dnstt_ssh
+    else
+        generate_run_dnstt_socks5
+    fi
+}
+
+generate_run_dnstt_socks5() {
+    info "Generating run_dnstt.sh (SOCKS5 mode)..."
 
     cat > "$INSTALL_DIR/run_dnstt.sh" <<DNSTT_SCRIPT
 #!/bin/bash
@@ -1214,6 +1301,517 @@ DNSTT_SCRIPT
 
     chmod +x "$INSTALL_DIR/run_dnstt.sh"
     success "run_dnstt.sh written → $INSTALL_DIR/run_dnstt.sh"
+}
+
+generate_run_dnstt_ssh() {
+    info "Generating run_dnstt.sh (SSH mode)..."
+
+    # dnstt SOCKS5 intermediate ports sit just below the xray-facing SSH -D ports
+    # e.g. 25 instances: dnstt on 6976-7000, SSH -D on 7001-7025 (no overlap)
+    local dnstt_base_port=$((DNSTT_START_PORT - DNSTT_INSTANCE_COUNT))
+
+    cat > "$INSTALL_DIR/run_dnstt.sh" <<DNSTT_SSH_SCRIPT
+#!/bin/bash
+
+# Configuration
+DNSTT_MODE="ssh"
+DNS_FILE="dns.txt"
+_DNS_FILE="_dns.txt"
+DNS_ASSIGNMENTS_FILE="dns_assignments.txt"
+DNS_FAILURES_FILE="dns_failures.txt"
+DNS_PIDS_FILE="dns_pids.txt"
+PUBKEY="$DNSTT_PUBKEY"
+DOMAIN="$DNSTT_DOMAIN"
+SCANNER_PUBKEY="$DNSTT_SCANNER_PUBKEY"
+SCANNER_DOMAIN="$DNSTT_SCANNER_DOMAIN"
+SSH_USER="$DNSTT_SSH_USER"
+SSH_PASS="$DNSTT_SSH_PASS"
+# xray-facing ports — SSH -D dynamic SOCKS5 listens here
+START_PORT=$DNSTT_START_PORT
+END_PORT=$DNSTT_END_PORT
+# intermediate dnstt-client SOCKS5 ports (just below xray ports)
+DNSTT_BASE_PORT=$dnstt_base_port
+SCAN_INTERVAL=600
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Initialize _dns.txt from dns.txt if it doesn't exist
+if [ ! -f "\$_DNS_FILE" ]; then
+    if [ -f "\$DNS_FILE" ]; then
+        echo "Copying \$DNS_FILE to \$_DNS_FILE for faster scanning..."
+        cp "\$DNS_FILE" "\$_DNS_FILE"
+    else
+        echo "WARNING: \$DNS_FILE not found, creating empty \$_DNS_FILE"
+        touch "\$_DNS_FILE"
+    fi
+fi
+
+[ ! -f "\$DNS_FAILURES_FILE" ] && touch "\$DNS_FAILURES_FILE"
+[ ! -f "\$DNS_PIDS_FILE" ]     && touch "\$DNS_PIDS_FILE"
+
+# Function to refill _dns.txt from dns.txt if empty
+refill_dns_file() {
+    if [ ! -s "\$_DNS_FILE" ]; then
+        if [ -f "\$DNS_FILE" ] && [ -s "\$DNS_FILE" ]; then
+            echo "WARNING: \$_DNS_FILE is empty, refilling from \$DNS_FILE..."
+            cp "\$DNS_FILE" "\$_DNS_FILE"
+            echo "Refilled \$_DNS_FILE with \$(wc -l < "\$_DNS_FILE") DNS entries from \$DNS_FILE"
+            > "\$DNS_FAILURES_FILE"
+            echo "Reset failure tracking"
+            return 0
+        else
+            echo "ERROR: Cannot refill \$_DNS_FILE - \$DNS_FILE is empty or missing"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Function to scan DNS servers and get all with tunnels
+scan_and_get_all_dns() {
+    local DNS_WITH_TUNNELS_FILE="dns_with_tunnels.txt"
+
+    echo "=== Scanning DNS servers (SSH mode) ==="
+    echo "DNS file: \$_DNS_FILE"
+    echo "Scanner domain: \$SCANNER_DOMAIN"
+
+    if [ ! -f "./dnstt-dns-scanner" ] && [ ! -f "./dnstt-dns-scanner.exe" ]; then
+        echo "ERROR: dnstt-dns-scanner executable not found in current directory"
+        return 1
+    fi
+
+    if [ ! -f "\$_DNS_FILE" ] || [ ! -s "\$_DNS_FILE" ]; then
+        if ! refill_dns_file; then
+            echo "ERROR: Cannot proceed with empty DNS file"
+            return 1
+        fi
+    fi
+
+    local dns_count=\$(wc -l < "\$_DNS_FILE" | tr -d ' ')
+    local cpu_cores=\$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1)
+    local threads=\$((dns_count / 10))
+    local max_threads=\$((cpu_cores * 50))
+    [ \$max_threads -gt 500 ] && max_threads=500
+    [ \$threads -gt \$max_threads ] && threads=\$max_threads
+    [ \$threads -lt 1 ] && threads=1
+    echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
+
+    local quick_arg=""
+    if [ \$dns_count -gt 512 ]; then
+        quick_arg=" -quick"
+        echo "Using -quick mode (DNS > 512) to speed up scan."
+    fi
+
+    local scanner_out_file=\$(mktemp)
+    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$SCANNER_PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads\${quick_arg} \$SCANNER_DOMAIN"
+
+    echo "Executing command: \$scanner_cmd"
+    eval "\$scanner_cmd" > "\$scanner_out_file" 2>&1
+    local scanner_exit_code=\$?
+    echo "Scanner exit code: \$scanner_exit_code"
+    cat "\$scanner_out_file"
+    if [ \$scanner_exit_code -ne 0 ]; then
+        echo "ERROR: Scanner failed with exit code \$scanner_exit_code"
+        rm -f "\$scanner_out_file"
+        return 1
+    fi
+
+    echo "--- Parsing tunnel-capable IPs from scanner output ---"
+    awk '/^Tunnel-capable DNS servers IPs:/{found=1; next} found && /^[0-9]/{print} found && !/^[0-9]/{exit}' \
+        "\$scanner_out_file" > "\$DNS_WITH_TUNNELS_FILE"
+    local tunnel_count=\$(wc -l < "\$DNS_WITH_TUNNELS_FILE" | tr -d ' ')
+    echo "Found \$tunnel_count tunnel-capable DNS servers"
+
+    echo "--- Updating failure tracking ---"
+    local fail_inc=1
+    [ -n "\$quick_arg" ] && fail_inc=5
+    local new_failures_file=\$(mktemp)
+    local new_dns_file=\$(mktemp)
+
+    awk -v fail_inc="\$fail_inc" -v failures_file="\$DNS_FAILURES_FILE" \
+        -v dns_file="\$_DNS_FILE" -v new_dns_file="\$new_dns_file" '
+    BEGIN {
+        while ((getline line < failures_file) > 0) {
+            n = split(line, a, "|")
+            if (n == 2) fail_count[a[1]] = a[2]+0
+        }
+        close(failures_file)
+        while ((getline ip < dns_file) > 0) {
+            if (ip != "") scanned[ip] = 1
+        }
+        close(dns_file)
+    }
+    { is_tunnel[\$1] = 1 }
+    END {
+        for (ip in scanned) {
+            if (ip in is_tunnel) {
+                printf "DNS %s: Has tunnel, resetting failure count\n", ip > "/dev/stderr"
+            } else {
+                cnt = (ip in fail_count ? fail_count[ip] : 0) + fail_inc
+                printf "%s|%d\n", ip, cnt
+                printf "DNS %s: No tunnel, failure count: %d\n", ip, cnt > "/dev/stderr"
+                if (cnt < 10) print ip > new_dns_file
+                else printf "DNS %s: Removed from _dns.txt (10 consecutive failures)\n", ip > "/dev/stderr"
+            }
+        }
+    }
+    ' "\$DNS_WITH_TUNNELS_FILE" > "\$new_failures_file"
+
+    mv "\$new_failures_file" "\$DNS_FAILURES_FILE"
+    cat "\$DNS_WITH_TUNNELS_FILE" >> "\$new_dns_file"
+    sort -u "\$new_dns_file" -o "\$new_dns_file"
+    mv "\$new_dns_file" "\$_DNS_FILE"
+    rm -f "\$scanner_out_file"
+
+    if [ "\$tunnel_count" -gt 0 ]; then
+        echo "=== Saved \$tunnel_count DNS servers with tunnels to \$DNS_WITH_TUNNELS_FILE ==="
+        return 0
+    else
+        echo "ERROR: No tunnel-capable DNS servers found!"
+        > "\$DNS_WITH_TUNNELS_FILE"
+        return 1
+    fi
+}
+
+# PID file format: PORT|DNSTT_PID|SSH_PID
+# dnstt-client runs SOCKS5 on DNSTT_BASE_PORT+(PORT-START_PORT)
+# SSH -D PORT connects to dnstt SOCKS5 on DNSTT_BASE_PORT+(PORT-START_PORT)
+
+dnstt_port_for() {
+    local port=\$1
+    echo \$((DNSTT_BASE_PORT + port - START_PORT))
+}
+
+kill_pid_gracefully() {
+    local pid=\$1
+    if kill -0 "\$pid" 2>/dev/null; then
+        kill -TERM "\$pid" 2>/dev/null
+        local w=0
+        while [ \$w -lt 30 ] && kill -0 "\$pid" 2>/dev/null; do
+            sleep 0.1; w=\$((w+1))
+        done
+        kill -0 "\$pid" 2>/dev/null && kill -KILL "\$pid" 2>/dev/null
+    fi
+}
+
+save_instance_pids() {
+    local port=\$1 dnstt_pid=\$2 ssh_pid=\$3
+    local tmp=\$(mktemp)
+    [ -f "\$DNS_PIDS_FILE" ] && grep -v "^\${port}|" "\$DNS_PIDS_FILE" > "\$tmp" 2>/dev/null || true
+    echo "\${port}|\${dnstt_pid}|\${ssh_pid}" >> "\$tmp"
+    mv "\$tmp" "\$DNS_PIDS_FILE"
+}
+
+remove_instance_pid() {
+    local port=\$1
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        local tmp=\$(mktemp)
+        grep -v "^\${port}|" "\$DNS_PIDS_FILE" > "\$tmp" 2>/dev/null || true
+        mv "\$tmp" "\$DNS_PIDS_FILE"
+    fi
+}
+
+stop_instance_gracefully() {
+    local port=\$1
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        local entry=\$(grep "^\${port}|" "\$DNS_PIDS_FILE" | head -1)
+        if [ -n "\$entry" ]; then
+            local dnstt_pid=\$(echo "\$entry" | cut -d'|' -f2)
+            local ssh_pid=\$(echo "\$entry" | cut -d'|' -f3)
+            [ -n "\$ssh_pid" ]   && kill_pid_gracefully "\$ssh_pid"
+            [ -n "\$dnstt_pid" ] && kill_pid_gracefully "\$dnstt_pid"
+        fi
+    fi
+    pkill -f "dnstt-client.*:\$(dnstt_port_for \$port)" 2>/dev/null || true
+    remove_instance_pid "\$port"
+}
+
+is_instance_running() {
+    local port=\$1
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        local entry=\$(grep "^\${port}|" "\$DNS_PIDS_FILE" | head -1)
+        if [ -n "\$entry" ]; then
+            local ssh_pid=\$(echo "\$entry" | cut -d'|' -f3)
+            kill -0 "\$ssh_pid" 2>/dev/null && return 0
+        fi
+    fi
+    return 1
+}
+
+start_instance() {
+    local port=\$1
+    local dns_ip=\$2
+    local dnstt_port=\$(dnstt_port_for "\$port")
+    local log_file="logs/client_\$port.log"
+
+    stop_instance_gracefully "\$port"
+
+    # Step 1: start dnstt-client in SOCKS5 mode on the intermediate port
+    echo "Starting dnstt-client SOCKS5 on 127.0.0.1:\$dnstt_port via DNS \$dns_ip"
+    nohup ./dnstt-client -utls Chrome_120 -udp "\$dns_ip:53" -pubkey "\$PUBKEY" "\$DOMAIN" \
+        "127.0.0.1:\$dnstt_port" >> "\$log_file" 2>&1 &
+    local dnstt_pid=\$!
+
+    # Give dnstt-client a moment to bind
+    sleep 0.5
+    if ! kill -0 "\$dnstt_pid" 2>/dev/null; then
+        echo "WARNING: dnstt-client died immediately on port \$dnstt_port"
+        return 1
+    fi
+
+    # Step 2: SSH connects to dnstt SOCKS5 port directly with -D (dynamic SOCKS5 forwarding)
+    # Use SSH_ASKPASS so no sshpass dependency is needed
+    echo "Starting SSH -D \$port → 127.0.0.1:\$dnstt_port as \$SSH_USER"
+    local askpass_script=\$(mktemp)
+    chmod 700 "\$askpass_script"
+    printf '#!/bin/sh\nprintf "%%s" "%s"\n' "\$SSH_PASS" > "\$askpass_script"
+    nohup env DISPLAY= SSH_ASKPASS="\$askpass_script" SSH_ASKPASS_REQUIRE=force ssh \
+        -o StrictHostKeyChecking=no \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
+        -N \
+        -D "127.0.0.1:\$port" \
+        -p "\$dnstt_port" \
+        "\${SSH_USER}@127.0.0.1" \
+        >> "\$log_file" 2>&1 &
+    local ssh_pid=\$!
+
+    save_instance_pids "\$port" "\$dnstt_pid" "\$ssh_pid"
+    echo "Started: dnstt PID=\$dnstt_pid SSH PID=\$ssh_pid on port \$port"
+
+    rm -f "\$askpass_script"
+    sleep 0.5
+    if ! kill -0 "\$ssh_pid" 2>/dev/null; then
+        echo "WARNING: SSH process died immediately on port \$port"
+        kill_pid_gracefully "\$dnstt_pid"
+        remove_instance_pid "\$port"
+        return 1
+    fi
+    return 0
+}
+
+get_assigned_dns() {
+    local port=\$1
+    if [ -f "\$DNS_ASSIGNMENTS_FILE" ]; then
+        local assigned_dns=\$(grep "^\${port}|" "\$DNS_ASSIGNMENTS_FILE" | cut -d'|' -f2)
+        [ -n "\$assigned_dns" ] && echo "\$assigned_dns" && return 0
+    fi
+    return 1
+}
+
+check_and_restart() {
+    local port=\$1
+    if ! is_instance_running "\$port"; then
+        echo "SSH instance on port \$port is not running, restarting..."
+        local assigned_dns=\$(get_assigned_dns "\$port")
+        if [ -n "\$assigned_dns" ]; then
+            rm -f "logs/client_\$port.log"
+            stop_instance_gracefully "\$port"
+            sleep 1
+            start_instance "\$port" "\$assigned_dns"
+        else
+            echo "Warning: No DNS assigned to port \$port, skipping restart"
+            remove_instance_pid "\$port"
+        fi
+    fi
+}
+
+distribute_dns_to_instances() {
+    local DNS_WITH_TUNNELS_FILE="dns_with_tunnels.txt"
+
+    if [ ! -f "\$DNS_WITH_TUNNELS_FILE" ] || [ ! -s "\$DNS_WITH_TUNNELS_FILE" ]; then
+        echo "Error: No DNS with tunnels available"
+        return 1
+    fi
+
+    local current_dns=()
+    while IFS= read -r ip; do
+        [ -n "\$ip" ] && current_dns+=("\$ip")
+    done < "\$DNS_WITH_TUNNELS_FILE"
+
+    if [ \${#current_dns[@]} -eq 0 ]; then
+        echo "Error: No DNS with tunnels found"
+        return 1
+    fi
+
+    echo "Distributing \${#current_dns[@]} DNS servers across SSH instances..."
+
+    declare -A prev_assignments
+    if [ -f "\$DNS_ASSIGNMENTS_FILE" ]; then
+        while IFS='|' read -r port dns_ip; do
+            [ -n "\$port" ] && [ -n "\$dns_ip" ] && prev_assignments["\$dns_ip"]="\$port"
+        done < "\$DNS_ASSIGNMENTS_FILE"
+    fi
+
+    declare -A port_assignments
+
+    for dns_ip in "\${current_dns[@]}"; do
+        if [ -n "\${prev_assignments[\$dns_ip]+x}" ]; then
+            local port="\${prev_assignments[\$dns_ip]}"
+            if [ "\$port" -ge "\$START_PORT" ] && [ "\$port" -le "\$END_PORT" ]; then
+                port_assignments["\$port"]="\$dns_ip"
+            fi
+        fi
+    done
+
+    for dns_ip in "\${current_dns[@]}"; do
+        local already_assigned=0
+        for assigned_port in "\${!port_assignments[@]}"; do
+            if [ "\${port_assignments[\$assigned_port]}" = "\$dns_ip" ]; then
+                already_assigned=1; break
+            fi
+        done
+        if [ \$already_assigned -eq 0 ]; then
+            for port in \$(seq \$START_PORT \$END_PORT); do
+                if [ -z "\${port_assignments[\$port]+x}" ]; then
+                    port_assignments["\$port"]="\$dns_ip"
+                    break
+                fi
+            done
+        fi
+    done
+
+    local remaining_dns=()
+    for dns_ip in "\${current_dns[@]}"; do
+        local found=0
+        for assigned_port in "\${!port_assignments[@]}"; do
+            if [ "\${port_assignments[\$assigned_port]}" = "\$dns_ip" ]; then found=1; break; fi
+        done
+        [ \$found -eq 0 ] && remaining_dns+=("\$dns_ip")
+    done
+
+    if [ \${#remaining_dns[@]} -gt 0 ]; then
+        local remaining_index=0
+        for port in \$(seq \$START_PORT \$END_PORT); do
+            if [ -z "\${port_assignments[\$port]+x}" ] && [ \$remaining_index -lt \${#remaining_dns[@]} ]; then
+                port_assignments["\$port"]="\${remaining_dns[\$remaining_index]}"
+                remaining_index=\$((remaining_index + 1))
+            fi
+        done
+    fi
+
+    > "\$DNS_ASSIGNMENTS_FILE"
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        if [ -n "\${port_assignments[\$port]+x}" ]; then
+            echo "\${port}|\${port_assignments[\$port]}" >> "\$DNS_ASSIGNMENTS_FILE"
+        fi
+    done
+
+    echo "Starting/restarting SSH instances with assigned DNS..."
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        if [ -n "\${port_assignments[\$port]+x}" ]; then
+            start_instance "\$port" "\${port_assignments[\$port]}"
+            sleep 0.1
+        else
+            stop_instance_gracefully "\$port"
+        fi
+    done
+
+    echo "SSH distribution complete: \${#port_assignments[@]} instances assigned"
+    return 0
+}
+
+# Initial startup
+echo "=========================================="
+echo "Starting dnstt-runner (SSH -D mode)"
+echo "Working directory: \$(pwd)"
+echo "SSH user: \$SSH_USER"
+echo "xray SOCKS5 ports (SSH -D): \$START_PORT-\$END_PORT"
+echo "dnstt SOCKS5 ports (intermediate): \$DNSTT_BASE_PORT-\$((START_PORT - 1))"
+echo "Scan interval: 10 minutes after completion"
+echo "=========================================="
+echo ""
+
+if [ -f "\$DNS_ASSIGNMENTS_FILE" ] && [ -s "\$DNS_ASSIGNMENTS_FILE" ]; then
+    echo "Previous DNS assignments found, starting instances..."
+    while IFS='|' read -r port dns_ip; do
+        [ -n "\$port" ] && [ -n "\$dns_ip" ] && start_instance "\$port" "\$dns_ip"
+    done < "\$DNS_ASSIGNMENTS_FILE"
+    echo "Started instances. Periodic scanner will run first scan shortly."
+else
+    echo "No previous DNS assignments found, running initial scan..."
+    scan_and_get_all_dns
+    initial_scan_result=\$?
+    if [ \$initial_scan_result -eq 0 ]; then
+        distribute_dns_to_instances || { echo "ERROR: Failed to distribute DNS. Exiting."; exit 1; }
+    else
+        echo "ERROR: Initial scan found no DNS servers with tunnels. Exiting."
+        exit 1
+    fi
+fi
+
+# Background periodic scanner
+(
+    SCAN_COUNT=0
+    while true; do
+        SCAN_COUNT=\$((SCAN_COUNT + 1))
+        scan_start_time=\$(date +%s)
+
+        if [ \$((SCAN_COUNT % 20)) -eq 0 ]; then
+            echo "=== Scan #\${SCAN_COUNT}: Full refresh — restoring all IPs from \$DNS_FILE ==="
+            if [ -f "\$DNS_FILE" ] && [ -s "\$DNS_FILE" ]; then
+                cp "\$DNS_FILE" "\$_DNS_FILE"
+                > "\$DNS_FAILURES_FILE"
+            fi
+        fi
+
+        echo "Running periodic DNS scan (#\${SCAN_COUNT})..."
+        scan_and_get_all_dns
+        scan_result=\$?
+        scan_end_time=\$(date +%s)
+        scan_duration=\$((scan_end_time - scan_start_time))
+
+        if [ \$scan_result -eq 0 ]; then
+            distribute_dns_to_instances
+        else
+            refill_dns_file
+            echo "Skipping distribution - no tunnels found"
+        fi
+
+        next_scan_time=\$((scan_end_time + 600))
+        current_time=\$(date +%s)
+        sleep_duration=\$((next_scan_time - current_time))
+        [ \$sleep_duration -lt 0 ] && sleep_duration=0
+        echo "Scan completed in \${scan_duration}s. Next scan in \${sleep_duration}s."
+        sleep \$sleep_duration
+    done
+) &
+SCANNER_PID=\$!
+
+cleanup() {
+    echo "Shutting down gracefully..."
+    kill \$SCANNER_PID 2>/dev/null
+    if [ -f "\$DNS_PIDS_FILE" ]; then
+        while IFS='|' read -r port _rest; do
+            [ -n "\$port" ] && stop_instance_gracefully "\$port"
+        done < "\$DNS_PIDS_FILE"
+    fi
+    pkill -f "dnstt-client.*127.0.0.1:\$DNSTT_BASE_PORT" 2>/dev/null || true
+    exit
+}
+trap cleanup SIGINT SIGTERM
+
+while true; do
+    echo "Checking for failed SSH instances..."
+
+    if [ ! -s "\$_DNS_FILE" ]; then
+        echo "WARNING: \$_DNS_FILE is empty, attempting to refill..."
+        refill_dns_file
+    fi
+
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        check_and_restart \$port
+    done
+
+    echo "Sleeping for 5 seconds before next check..."
+    sleep 5
+done
+DNSTT_SSH_SCRIPT
+
+    chmod +x "$INSTALL_DIR/run_dnstt.sh"
+    success "run_dnstt.sh written (SSH mode) → $INSTALL_DIR/run_dnstt.sh"
 }
 
 generate_run_slipstream() {
@@ -1792,6 +2390,13 @@ print_summary() {
             echo -e "  dnstt domain : $DNSTT_DOMAIN"
             echo -e "  dnstt pubkey : ${DNSTT_PUBKEY:0:16}..."
             echo -e "  dnstt inst.  : $DNSTT_INSTANCE_COUNT (ports $DNSTT_START_PORT–$DNSTT_END_PORT)"
+            if [ "${DNSTT_MODE:-socks5}" = "ssh" ]; then
+                echo -e "  dnstt mode   : SSH -D (dynamic SOCKS5)"
+                echo -e "  SSH user     : ${DNSTT_SSH_USER}"
+                echo -e "  Scanner dom  : $DNSTT_SCANNER_DOMAIN"
+            else
+                echo -e "  dnstt mode   : SOCKS5"
+            fi
             ;;
         2)
             echo -e "  Binaries     : xray, slipstream-client, dnstt-dns-scanner"
