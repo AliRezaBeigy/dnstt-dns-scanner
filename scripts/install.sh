@@ -1093,82 +1093,25 @@ distribute_dns_to_instances() {
         return 1
     fi
 
-    echo "Distributing \${#current_dns[@]} DNS servers across instances..."
-
-    declare -A prev_assignments
-    if [ -f "\$DNS_ASSIGNMENTS_FILE" ]; then
-        while IFS='|' read -r port dns_ip; do
-            [ -n "\$port" ] && [ -n "\$dns_ip" ] && prev_assignments["\$dns_ip"]="\$port"
-        done < "\$DNS_ASSIGNMENTS_FILE"
-        echo "Loaded \${#prev_assignments[@]} previous DNS assignments"
-    fi
+    echo "Distributing \${#current_dns[@]} DNS servers across instances (round-robin)..."
 
     declare -A port_assignments
-
-    for dns_ip in "\${current_dns[@]}"; do
-        if [ -n "\${prev_assignments[\$dns_ip]+x}" ]; then
-            local port="\${prev_assignments[\$dns_ip]}"
-            if [ "\$port" -ge "\$START_PORT" ] && [ "\$port" -le "\$END_PORT" ]; then
-                port_assignments["\$port"]="\$dns_ip"
-                echo "Preserved assignment: DNS \$dns_ip -> Port \$port"
-            fi
-        fi
+    local idx=0
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        port_assignments["\$port"]="\${current_dns[\$((idx % \${#current_dns[@]}))]}"
+        idx=\$((idx + 1))
     done
-
-    for dns_ip in "\${current_dns[@]}"; do
-        local already_assigned=0
-        for assigned_port in "\${!port_assignments[@]}"; do
-            if [ "\${port_assignments[\$assigned_port]}" = "\$dns_ip" ]; then
-                already_assigned=1; break
-            fi
-        done
-        if [ \$already_assigned -eq 0 ]; then
-            for port in \$(seq \$START_PORT \$END_PORT); do
-                if [ -z "\${port_assignments[\$port]+x}" ]; then
-                    port_assignments["\$port"]="\$dns_ip"
-                    echo "New assignment: DNS \$dns_ip -> Port \$port"
-                    break
-                fi
-            done
-        fi
-    done
-
-    local remaining_dns=()
-    for dns_ip in "\${current_dns[@]}"; do
-        local found=0
-        for assigned_port in "\${!port_assignments[@]}"; do
-            if [ "\${port_assignments[\$assigned_port]}" = "\$dns_ip" ]; then found=1; break; fi
-        done
-        [ \$found -eq 0 ] && remaining_dns+=("\$dns_ip")
-    done
-
-    if [ \${#remaining_dns[@]} -gt 0 ]; then
-        local remaining_index=0
-        for port in \$(seq \$START_PORT \$END_PORT); do
-            if [ -z "\${port_assignments[\$port]+x}" ] && [ \$remaining_index -lt \${#remaining_dns[@]} ]; then
-                port_assignments["\$port"]="\${remaining_dns[\$remaining_index]}"
-                echo "Round-robin assignment: DNS \${remaining_dns[\$remaining_index]} -> Port \$port"
-                remaining_index=\$((remaining_index + 1))
-            fi
-        done
-    fi
 
     > "\$DNS_ASSIGNMENTS_FILE"
     for port in \$(seq \$START_PORT \$END_PORT); do
-        if [ -n "\${port_assignments[\$port]+x}" ]; then
-            echo "\${port}|\${port_assignments[\$port]}" >> "\$DNS_ASSIGNMENTS_FILE"
-        fi
+        echo "\${port}|\${port_assignments[\$port]}" >> "\$DNS_ASSIGNMENTS_FILE"
+        echo "Assigned: DNS \${port_assignments[\$port]} -> Port \$port"
     done
 
     echo "Starting/restarting instances with assigned DNS..."
     for port in \$(seq \$START_PORT \$END_PORT); do
-        if [ -n "\${port_assignments[\$port]+x}" ]; then
-            start_instance "\$port" "\${port_assignments[\$port]}"
-            sleep 0.1
-        else
-            echo "No DNS assigned to port \$port, stopping instance gracefully..."
-            stop_instance_gracefully "\$port"
-        fi
+        start_instance "\$port" "\${port_assignments[\$port]}"
+        sleep 0.1
     done
 
     echo "DNS distribution complete: \${#port_assignments[@]} instances assigned"
@@ -1313,6 +1256,8 @@ _DNS_FILE="_dns.txt"
 DNS_ASSIGNMENTS_FILE="dns_assignments.txt"
 DNS_FAILURES_FILE="dns_failures.txt"
 DNS_PIDS_FILE="dns_pids.txt"
+DNS_START_TIMES_FILE="dns_start_times.txt"
+SSH_CONNECT_GRACE=60
 PUBKEY="$DNSTT_PUBKEY"
 DOMAIN="$DNSTT_DOMAIN"
 SCANNER_PUBKEY="$DNSTT_SCANNER_PUBKEY"
@@ -1340,8 +1285,9 @@ if [ ! -f "\$_DNS_FILE" ]; then
     fi
 fi
 
-[ ! -f "\$DNS_FAILURES_FILE" ] && touch "\$DNS_FAILURES_FILE"
-[ ! -f "\$DNS_PIDS_FILE" ]     && touch "\$DNS_PIDS_FILE"
+[ ! -f "\$DNS_FAILURES_FILE" ]     && touch "\$DNS_FAILURES_FILE"
+[ ! -f "\$DNS_PIDS_FILE" ]         && touch "\$DNS_PIDS_FILE"
+[ ! -f "\$DNS_START_TIMES_FILE" ]  && touch "\$DNS_START_TIMES_FILE"
 
 # Function to refill _dns.txt from dns.txt if empty
 refill_dns_file() {
@@ -1490,6 +1436,25 @@ save_instance_pids() {
     mv "\$tmp" "\$DNS_PIDS_FILE"
 }
 
+save_instance_start_time() {
+    local port=\$1
+    local tmp=\$(mktemp)
+    [ -f "\$DNS_START_TIMES_FILE" ] && grep -v "^\${port}|" "\$DNS_START_TIMES_FILE" > "\$tmp" 2>/dev/null || true
+    echo "\${port}|\$(date +%s)" >> "\$tmp"
+    mv "\$tmp" "\$DNS_START_TIMES_FILE"
+}
+
+is_in_grace_period() {
+    local port=\$1
+    [ ! -f "\$DNS_START_TIMES_FILE" ] && return 1
+    local entry=\$(grep "^\${port}|" "\$DNS_START_TIMES_FILE" | head -1)
+    [ -z "\$entry" ] && return 1
+    local started=\$(echo "\$entry" | cut -d'|' -f2)
+    local now=\$(date +%s)
+    [ \$((now - started)) -lt \$SSH_CONNECT_GRACE ] && return 0
+    return 1
+}
+
 remove_instance_pid() {
     local port=\$1
     if [ -f "\$DNS_PIDS_FILE" ]; then
@@ -1511,6 +1476,7 @@ stop_instance_gracefully() {
         fi
     fi
     pkill -f "dnstt-client.*:\$(dnstt_port_for \$port)" 2>/dev/null || true
+    rm -f "logs/askpass_\$port.sh"
     remove_instance_pid "\$port"
 }
 
@@ -1550,10 +1516,12 @@ start_instance() {
     # Step 2: SSH connects to dnstt SOCKS5 port directly with -D (dynamic SOCKS5 forwarding)
     # Use SSH_ASKPASS so no sshpass dependency is needed
     echo "Starting SSH -D \$port → 127.0.0.1:\$dnstt_port as \$SSH_USER"
-    local askpass_script=\$(mktemp)
-    chmod 700 "\$askpass_script"
+    local askpass_script="logs/askpass_\$port.sh"
+    local ssh_log_file="logs/client_ssh_\$port.log"
     printf '#!/bin/sh\nprintf "%%s" "%s"\n' "\$SSH_PASS" > "\$askpass_script"
+    chmod 700 "\$askpass_script"
     nohup env DISPLAY= SSH_ASKPASS="\$askpass_script" SSH_ASKPASS_REQUIRE=force ssh \
+        -v \
         -o StrictHostKeyChecking=no \
         -o ExitOnForwardFailure=yes \
         -o ServerAliveInterval=30 \
@@ -1562,13 +1530,11 @@ start_instance() {
         -D "127.0.0.1:\$port" \
         -p "\$dnstt_port" \
         "\${SSH_USER}@127.0.0.1" \
-        >> "\$log_file" 2>&1 &
+        >> "\$ssh_log_file" 2>&1 &
     local ssh_pid=\$!
 
     save_instance_pids "\$port" "\$dnstt_pid" "\$ssh_pid"
     echo "Started: dnstt PID=\$dnstt_pid SSH PID=\$ssh_pid on port \$port"
-
-    rm -f "\$askpass_script"
     sleep 0.5
     if ! kill -0 "\$ssh_pid" 2>/dev/null; then
         echo "WARNING: SSH process died immediately on port \$port"
@@ -1576,6 +1542,8 @@ start_instance() {
         remove_instance_pid "\$port"
         return 1
     fi
+    save_instance_start_time "\$port"
+    echo "SSH is connecting through dnstt (grace period: \${SSH_CONNECT_GRACE}s)..."
     return 0
 }
 
@@ -1591,15 +1559,61 @@ get_assigned_dns() {
 check_and_restart() {
     local port=\$1
     if ! is_instance_running "\$port"; then
+        if is_in_grace_period "\$port"; then
+            echo "SSH instance on port \$port is still connecting (within \${SSH_CONNECT_GRACE}s grace period), skipping restart"
+            return 0
+        fi
         echo "SSH instance on port \$port is not running, restarting..."
+
+        # Diagnose why it's not running
+        local pid_entry=\$(grep "^\${port}|" "\$DNS_PIDS_FILE" 2>/dev/null | head -1)
+        if [ -z "\$pid_entry" ]; then
+            echo "  [diag] port \$port: no entry in \$DNS_PIDS_FILE"
+        else
+            local dnstt_pid=\$(echo "\$pid_entry" | cut -d'|' -f2)
+            local ssh_pid=\$(echo "\$pid_entry" | cut -d'|' -f3)
+            echo "  [diag] port \$port: PID file entry: \$pid_entry"
+            if kill -0 "\$dnstt_pid" 2>/dev/null; then
+                echo "  [diag] port \$port: dnstt-client PID \$dnstt_pid is alive"
+            else
+                echo "  [diag] port \$port: dnstt-client PID \$dnstt_pid is DEAD"
+            fi
+            if kill -0 "\$ssh_pid" 2>/dev/null; then
+                echo "  [diag] port \$port: SSH PID \$ssh_pid is alive"
+            else
+                echo "  [diag] port \$port: SSH PID \$ssh_pid is DEAD"
+            fi
+        fi
+        local log_file="logs/client_\$port.log"
+        local ssh_log_file="logs/client_ssh_\$port.log"
+        if [ -f "\$log_file" ] && [ -s "\$log_file" ]; then
+            echo "  [diag] port \$port: last 10 lines of \$log_file (dnstt-client):"
+            tail -10 "\$log_file" | sed 's/^/    /'
+        else
+            echo "  [diag] port \$port: \$log_file is empty or missing"
+        fi
+        if [ -f "\$ssh_log_file" ] && [ -s "\$ssh_log_file" ]; then
+            echo "  [diag] port \$port: last 30 lines of \$ssh_log_file (SSH verbose):"
+            tail -30 "\$ssh_log_file" | sed 's/^/    /'
+        else
+            echo "  [diag] port \$port: \$ssh_log_file is empty or missing"
+        fi
+
         local assigned_dns=\$(get_assigned_dns "\$port")
         if [ -n "\$assigned_dns" ]; then
-            rm -f "logs/client_\$port.log"
+            echo "  [diag] port \$port: assigned DNS is \$assigned_dns, attempting restart"
+            rm -f "logs/client_\$port.log" "logs/client_ssh_\$port.log"
             stop_instance_gracefully "\$port"
             sleep 1
             start_instance "\$port" "\$assigned_dns"
         else
             echo "Warning: No DNS assigned to port \$port, skipping restart"
+            local _af_exists=no _af_lines=0
+            [ -f "\$DNS_ASSIGNMENTS_FILE" ] && _af_exists=yes && _af_lines=\$(wc -l < "\$DNS_ASSIGNMENTS_FILE")
+            echo "  [diag] port \$port: DNS_ASSIGNMENTS_FILE=\$DNS_ASSIGNMENTS_FILE exists=\$_af_exists size=\$_af_lines lines"
+            echo "  [diag] port \$port: assignments file contents:"
+            cat "\$DNS_ASSIGNMENTS_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (file not readable)"
+            echo "  [diag] port \$port: scanner only found \$_af_lines DNS server(s) — not enough for all \$((END_PORT - START_PORT + 1)) ports"
             remove_instance_pid "\$port"
         fi
     fi
@@ -1623,77 +1637,25 @@ distribute_dns_to_instances() {
         return 1
     fi
 
-    echo "Distributing \${#current_dns[@]} DNS servers across SSH instances..."
-
-    declare -A prev_assignments
-    if [ -f "\$DNS_ASSIGNMENTS_FILE" ]; then
-        while IFS='|' read -r port dns_ip; do
-            [ -n "\$port" ] && [ -n "\$dns_ip" ] && prev_assignments["\$dns_ip"]="\$port"
-        done < "\$DNS_ASSIGNMENTS_FILE"
-    fi
+    echo "Distributing \${#current_dns[@]} DNS servers across SSH instances (round-robin)..."
 
     declare -A port_assignments
-
-    for dns_ip in "\${current_dns[@]}"; do
-        if [ -n "\${prev_assignments[\$dns_ip]+x}" ]; then
-            local port="\${prev_assignments[\$dns_ip]}"
-            if [ "\$port" -ge "\$START_PORT" ] && [ "\$port" -le "\$END_PORT" ]; then
-                port_assignments["\$port"]="\$dns_ip"
-            fi
-        fi
+    local idx=0
+    for port in \$(seq \$START_PORT \$END_PORT); do
+        port_assignments["\$port"]="\${current_dns[\$((idx % \${#current_dns[@]}))]}"
+        idx=\$((idx + 1))
     done
-
-    for dns_ip in "\${current_dns[@]}"; do
-        local already_assigned=0
-        for assigned_port in "\${!port_assignments[@]}"; do
-            if [ "\${port_assignments[\$assigned_port]}" = "\$dns_ip" ]; then
-                already_assigned=1; break
-            fi
-        done
-        if [ \$already_assigned -eq 0 ]; then
-            for port in \$(seq \$START_PORT \$END_PORT); do
-                if [ -z "\${port_assignments[\$port]+x}" ]; then
-                    port_assignments["\$port"]="\$dns_ip"
-                    break
-                fi
-            done
-        fi
-    done
-
-    local remaining_dns=()
-    for dns_ip in "\${current_dns[@]}"; do
-        local found=0
-        for assigned_port in "\${!port_assignments[@]}"; do
-            if [ "\${port_assignments[\$assigned_port]}" = "\$dns_ip" ]; then found=1; break; fi
-        done
-        [ \$found -eq 0 ] && remaining_dns+=("\$dns_ip")
-    done
-
-    if [ \${#remaining_dns[@]} -gt 0 ]; then
-        local remaining_index=0
-        for port in \$(seq \$START_PORT \$END_PORT); do
-            if [ -z "\${port_assignments[\$port]+x}" ] && [ \$remaining_index -lt \${#remaining_dns[@]} ]; then
-                port_assignments["\$port"]="\${remaining_dns[\$remaining_index]}"
-                remaining_index=\$((remaining_index + 1))
-            fi
-        done
-    fi
 
     > "\$DNS_ASSIGNMENTS_FILE"
     for port in \$(seq \$START_PORT \$END_PORT); do
-        if [ -n "\${port_assignments[\$port]+x}" ]; then
-            echo "\${port}|\${port_assignments[\$port]}" >> "\$DNS_ASSIGNMENTS_FILE"
-        fi
+        echo "\${port}|\${port_assignments[\$port]}" >> "\$DNS_ASSIGNMENTS_FILE"
+        echo "Assigned: DNS \${port_assignments[\$port]} -> Port \$port"
     done
 
     echo "Starting/restarting SSH instances with assigned DNS..."
     for port in \$(seq \$START_PORT \$END_PORT); do
-        if [ -n "\${port_assignments[\$port]+x}" ]; then
-            start_instance "\$port" "\${port_assignments[\$port]}"
-            sleep 0.1
-        else
-            stop_instance_gracefully "\$port"
-        fi
+        start_instance "\$port" "\${port_assignments[\$port]}"
+        sleep 0.1
     done
 
     echo "SSH distribution complete: \${#port_assignments[@]} instances assigned"
