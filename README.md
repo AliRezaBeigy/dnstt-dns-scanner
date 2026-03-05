@@ -8,7 +8,7 @@ A powerful tool to scan IP address ranges and discover DNS servers that can be u
 
 ## Table of Contents
 
-- [Quick Install](#quick-install)
+- [Full Client Setup](#full-client-setup)
 - [Requirements](#requirements)
 - [Installation](#installation)
   - [Pre-built Binaries](#pre-built-binaries)
@@ -23,7 +23,7 @@ A powerful tool to scan IP address ranges and discover DNS servers that can be u
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
-## Quick Install (dnstt + dnstt-dns-scanner + xray)
+## Full Client Setup (dnstt / slipstream-rust / xdns + dnstt-dns-scanner + xray)
 
 Installer for load balancing and finding best dns server for dnstt on Linux or macOS (amd64 / arm64):
 

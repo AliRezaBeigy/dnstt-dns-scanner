@@ -98,6 +98,7 @@ ask_tunnel_mode() {
     echo "  1) dnstt only"
     echo "  2) slipstream-rust only"
     echo "  3) Both (half instances dnstt, half slipstream-rust)"
+    echo "  4) xdns (xray direct — VLESS+KCP+xdns, no tunnel client needed)"
     echo -e "${CYAN}Enter your choice [default: 1]:${NC} \c"
     read -r mode_choice
     TUNNEL_MODE="${mode_choice:-1}"
@@ -105,6 +106,7 @@ ask_tunnel_mode() {
         1) success "Mode: dnstt only" ;;
         2) success "Mode: slipstream-rust only" ;;
         3) success "Mode: Both (dnstt + slipstream-rust)" ;;
+        4) success "Mode: xdns (xray direct)" ;;
         *) warn "Invalid choice, defaulting to dnstt only."; TUNNEL_MODE=1 ;;
     esac
 }
@@ -179,8 +181,8 @@ download_tools() {
         success "xray installed → $INSTALL_DIR/xray"
     fi
 
-    # -- dnstt-client (skip for slipstream-only mode) --
-    if [ "${TUNNEL_MODE:-1}" != "2" ]; then
+    # -- dnstt-client (skip for slipstream-only or xdns mode) --
+    if [ "${TUNNEL_MODE:-1}" != "2" ] && [ "${TUNNEL_MODE:-1}" != "4" ]; then
         if [ -f "$INSTALL_DIR/dnstt-client" ]; then
             info "dnstt-client already exists, skipping download."
         else
@@ -195,8 +197,8 @@ download_tools() {
         fi
     fi
 
-    # -- slipstream-rust client (skip for dnstt-only mode) --
-    if [ "${TUNNEL_MODE:-1}" != "1" ]; then
+    # -- slipstream-rust client (skip for dnstt-only or xdns mode) --
+    if [ "${TUNNEL_MODE:-1}" != "1" ] && [ "${TUNNEL_MODE:-1}" != "4" ]; then
         if [ -f "$INSTALL_DIR/slipstream-client" ]; then
             info "slipstream-client already exists, skipping download."
         else
@@ -502,6 +504,37 @@ ask_slipstream_settings() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Step 6d — xdns settings (xray direct, no tunnel client)
+# ---------------------------------------------------------------------------
+ask_xdns_settings() {
+    echo ""
+    echo -e "${CYAN}=== xdns Settings (xray VLESS+KCP+xdns) ===${NC}"
+
+    echo -e "${CYAN}Enter VLESS UUID:${NC} \c"
+    read -r XDNS_UUID
+    [ -z "$XDNS_UUID" ] && die "UUID cannot be empty."
+
+    echo -e "${CYAN}Enter xdns domain (finalmask domain, e.g. x.example.com):${NC} \c"
+    read -r XDNS_DOMAIN
+    [ -z "$XDNS_DOMAIN" ] && die "xdns domain cannot be empty."
+
+    echo -e "${CYAN}Enter number of xdns outbound instances [default: 25]:${NC} \c"
+    read -r xdns_inst_input
+    XDNS_INSTANCE_COUNT="${xdns_inst_input:-25}"
+
+    echo ""
+    echo -e "${YELLOW}[INFO]${NC} The DNS scanner uses a dnstt server to find working DNS IPs."
+    echo -e "${CYAN}Enter dnstt domain (for scanner):${NC} \c"
+    read -r DNSTT_DOMAIN
+    [ -z "$DNSTT_DOMAIN" ] && die "dnstt domain cannot be empty."
+
+    echo -e "${CYAN}Enter dnstt server pubkey (for scanner):${NC} \c"
+    read -r DNSTT_PUBKEY
+    [ -z "$DNSTT_PUBKEY" ] && die "dnstt pubkey cannot be empty."
+    echo -e "${CYAN}======${NC}"
+}
+
 # Set unified port range variables used by xray config
 set_port_range() {
     # Initialize defaults for modes that don't use both tools
@@ -530,6 +563,12 @@ set_port_range() {
             START_PORT=$DNSTT_START_PORT
             END_PORT=$SLIP_END_PORT
             INSTANCE_COUNT=$((DNSTT_INSTANCE_COUNT + SLIP_INSTANCE_COUNT))
+            ;;
+        4)
+            # xdns — no local SOCKS ports; outbounds are direct xray configs
+            START_PORT=0
+            END_PORT=0
+            INSTANCE_COUNT="${XDNS_INSTANCE_COUNT:-1}"
             ;;
     esac
 }
@@ -650,21 +689,69 @@ EOF
         fi
     fi
 
-    # Build outbounds (N socks proxies + direct + block)
+    # Build outbounds
     local outbounds=""
-    local port
     local i=1
-    for port in $(seq "$START_PORT" "$END_PORT"); do
-        [ $i -gt 1 ] && outbounds="${outbounds},"$'\n'
-        # Determine if this port belongs to the slipstream range and auth is enabled
-        local slip_auth_entry=""
-        if [ "${SLIP_AUTH:-0}" -eq 1 ] && [ -n "${SLIP_START_PORT:-}" ] && [ -n "${SLIP_END_PORT:-}" ] \
-            && [ "$port" -ge "$SLIP_START_PORT" ] && [ "$port" -le "$SLIP_END_PORT" ]; then
-            slip_auth_entry="
+
+    if [ "${TUNNEL_MODE:-1}" = "4" ]; then
+        # xdns mode: VLESS+KCP+xdns outbounds
+        # Initial address 8.8.8.8 (valid DNS IP); run_xdns.sh replaces it with real scanned IPs
+        local total="${XDNS_INSTANCE_COUNT:-25}"
+        while [ $i -le "$total" ]; do
+            [ $i -gt 1 ] && outbounds="${outbounds},"$'\n'
+            outbounds="${outbounds}        {
+            \"tag\": \"proxy-${i}\",
+            \"protocol\": \"vless\",
+            \"settings\": {
+                \"vnext\": [
+                    {
+                        \"address\": \"8.8.8.8\",
+                        \"port\": 53,
+                        \"users\": [
+                            {
+                                \"id\": \"${XDNS_UUID}\",
+                                \"encryption\": \"none\"
+                            }
+                        ]
+                    }
+                ]
+            },
+            \"streamSettings\": {
+                \"network\": \"kcp\",
+                \"kcpSettings\": {
+                    \"mtu\": 101,
+                    \"tti\": 50,
+                    \"uplinkCapacity\": 1,
+                    \"downlinkCapacity\": 1
+                },
+                \"finalmask\": {
+                    \"udp\": [
+                        {
+                            \"type\": \"xdns\",
+                            \"settings\": {
+                                \"domain\": \"${XDNS_DOMAIN}\"
+                            }
+                        }
+                    ]
+                }
+            }
+        }"
+            i=$((i + 1))
+        done
+    else
+        # SOCKS-based outbounds (dnstt / slipstream)
+        local port
+        for port in $(seq "$START_PORT" "$END_PORT"); do
+            [ $i -gt 1 ] && outbounds="${outbounds},"$'\n'
+            # Determine if this port belongs to the slipstream range and auth is enabled
+            local slip_auth_entry=""
+            if [ "${SLIP_AUTH:-0}" -eq 1 ] && [ -n "${SLIP_START_PORT:-}" ] && [ -n "${SLIP_END_PORT:-}" ] \
+                && [ "$port" -ge "$SLIP_START_PORT" ] && [ "$port" -le "$SLIP_END_PORT" ]; then
+                slip_auth_entry="
                     \"user\": \"${SLIP_USER}\",
                     \"pass\": \"${SLIP_PASS}\","
-        fi
-        outbounds="${outbounds}        {
+            fi
+            outbounds="${outbounds}        {
             \"tag\": \"proxy-${i}\",
             \"protocol\": \"socks\",
             \"settings\": {
@@ -678,8 +765,9 @@ EOF
             \"streamSettings\": {\"network\": \"tcp\"},
             \"mux\": {\"enabled\": false, \"concurrency\": -1}
         }"
-        i=$((i + 1))
-    done
+            i=$((i + 1))
+        done
+    fi
 
     outbounds="${outbounds},"$'\n'"        {\"tag\": \"direct\", \"protocol\": \"freedom\"},"$'\n'"        {\"tag\": \"block\", \"protocol\": \"blackhole\"}"
 
@@ -735,6 +823,7 @@ generate_runner_scripts() {
         1) generate_run_dnstt ;;
         2) generate_run_slipstream ;;
         3) generate_run_dnstt; generate_run_slipstream; generate_run_both ;;
+        4) generate_run_xdns ;;
     esac
 }
 
@@ -847,7 +936,7 @@ scan_and_get_all_dns() {
     echo "DNS count: \$dns_count, CPU cores: \$cpu_cores, threads: \$threads (cap: \$max_threads)"
 
     local scanner_out_file=\$(mktemp)
-    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads \$DOMAIN"
+    local scanner_cmd="./dnstt-dns-scanner -ips \$_DNS_FILE -pubkey \$PUBKEY -test-domain test.k.markop.ir -test-txt \"TEST RESULT\" -threads \$threads -full-test \$DOMAIN"
 
     echo "Executing command: \$scanner_cmd"
     eval "\$scanner_cmd" > "\$scanner_out_file" 2>&1
@@ -2164,6 +2253,211 @@ BOTH_SCRIPT
     success "run_both.sh written → $INSTALL_DIR/run_both.sh"
 }
 
+generate_run_xdns() {
+    info "Generating run_xdns.sh..."
+
+    cat > "$INSTALL_DIR/run_xdns.sh" <<XDNS_SCRIPT
+#!/bin/bash
+# xdns runner — scans DNS servers, distributes IPs across xray VLESS+KCP+xdns outbounds,
+# rewrites xray-config.json and reloads xray on every scan cycle.
+
+DNS_FILE="dns.txt"
+_DNS_FILE="_dns.txt"
+DNS_FAILURES_FILE="xdns_dns_failures.txt"
+DNS_WITH_TUNNELS_FILE="xdns_dns_with_tunnels.txt"
+XRAY_CONFIG="xray-config.json"
+SCANNER_DOMAIN="$DNSTT_DOMAIN"
+SCANNER_PUBKEY="$DNSTT_PUBKEY"
+INSTANCE_COUNT=$XDNS_INSTANCE_COUNT
+
+mkdir -p logs
+
+# Seed _dns.txt from dns.txt on first run
+if [ ! -f "\$_DNS_FILE" ]; then
+    if [ -f "\$DNS_FILE" ]; then
+        cp "\$DNS_FILE" "\$_DNS_FILE"
+        echo "Seeded \$_DNS_FILE from \$DNS_FILE"
+    else
+        echo "ERROR: \$DNS_FILE not found"; exit 1
+    fi
+fi
+[ ! -f "\$DNS_FAILURES_FILE" ] && touch "\$DNS_FAILURES_FILE"
+
+refill_dns_file() {
+    if [ ! -s "\$_DNS_FILE" ] && [ -f "\$DNS_FILE" ] && [ -s "\$DNS_FILE" ]; then
+        cp "\$DNS_FILE" "\$_DNS_FILE"
+        > "\$DNS_FAILURES_FILE"
+        echo "Refilled \$_DNS_FILE from \$DNS_FILE"
+    fi
+}
+
+scan_dns() {
+    echo "=== Scanning DNS servers for xdns ==="
+    [ ! -s "\$_DNS_FILE" ] && { refill_dns_file || return 1; }
+
+    local dns_count=\$(wc -l < "\$_DNS_FILE" | tr -d ' ')
+    local cpu_cores=\$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1)
+    local threads=\$((dns_count / 10)); [ \$threads -lt 1 ] && threads=1
+    local max_threads=\$((cpu_cores * 50)); [ \$max_threads -gt 500 ] && max_threads=500
+    [ \$threads -gt \$max_threads ] && threads=\$max_threads
+    echo "DNS: \$dns_count entries, threads: \$threads"
+
+    local scanner_out=\$(mktemp)
+    ./dnstt-dns-scanner -ips "\$_DNS_FILE" -pubkey "\$SCANNER_PUBKEY" \
+        -test-domain test.k.markop.ir -test-txt "TEST RESULT" -threads "\$threads" "\$SCANNER_DOMAIN" \
+        > "\$scanner_out" 2>&1 || true
+    cat "\$scanner_out"
+
+    awk '/^Tunnel-capable DNS servers IPs:/{found=1; next} found && /^[0-9]/{print} found && !/^[0-9]/{exit}' \
+        "\$scanner_out" > "\$DNS_WITH_TUNNELS_FILE"
+    local tunnel_count=\$(wc -l < "\$DNS_WITH_TUNNELS_FILE" | tr -d ' ')
+    echo "Found \$tunnel_count working DNS servers"
+
+    # Update failure tracking and prune _dns.txt
+    local new_failures=\$(mktemp)
+    local new_dns=\$(mktemp)
+    awk -v fail_inc=1 -v failures_file="\$DNS_FAILURES_FILE" \
+        -v dns_file="\$_DNS_FILE" -v new_dns_file="\$new_dns" '
+    BEGIN {
+        while ((getline line < failures_file) > 0) { n=split(line,a,"|"); if(n==2) fail_count[a[1]]=a[2]+0 }
+        close(failures_file)
+        while ((getline ip < dns_file) > 0) { if(ip!="") scanned[ip]=1 }
+        close(dns_file)
+    }
+    { is_tunnel[\$1]=1 }
+    END {
+        for (ip in scanned) {
+            if (!(ip in is_tunnel)) {
+                cnt=(ip in fail_count ? fail_count[ip] : 0)+fail_inc
+                printf "%s|%d\n", ip, cnt
+                if (cnt < 10) print ip > new_dns_file
+            }
+        }
+    }
+    ' "\$DNS_WITH_TUNNELS_FILE" > "\$new_failures"
+    mv "\$new_failures" "\$DNS_FAILURES_FILE"
+    cat "\$DNS_WITH_TUNNELS_FILE" >> "\$new_dns"
+    sort -u "\$new_dns" -o "\$new_dns"
+    mv "\$new_dns" "\$_DNS_FILE"
+    rm -f "\$scanner_out"
+
+    [ "\$tunnel_count" -gt 0 ] && return 0 || return 1
+}
+
+# Rewrite xray-config.json: distribute scanned IPs round-robin across outbounds,
+# then reload xray (SIGHUP).
+apply_dns_to_xray() {
+    [ ! -s "\$DNS_WITH_TUNNELS_FILE" ] && { echo "No tunnel IPs available, skipping xray update"; return 1; }
+
+    # Read IPs into array
+    local ips=()
+    while IFS= read -r ip; do [ -n "\$ip" ] && ips+=("\$ip"); done < "\$DNS_WITH_TUNNELS_FILE"
+    local ip_count=\${#ips[@]}
+    echo "Distributing \$ip_count DNS IPs across \$INSTANCE_COUNT xray outbounds..."
+
+    # Build a sed script that replaces each placeholder address in outbound proxy-N
+    # The config has blocks like:  "tag": "proxy-1", ... "address": "x.x.x.x",
+    # We use python3 (or awk) to do a structured rewrite via JSON.
+    if command -v python3 &>/dev/null; then
+        python3 - "\$XRAY_CONFIG" "\$INSTANCE_COUNT" "\${ips[@]}" <<'PYEOF'
+import sys, json, copy
+
+config_file = sys.argv[1]
+instance_count = int(sys.argv[2])
+ips = sys.argv[3:]
+ip_count = len(ips)
+
+with open(config_file) as f:
+    cfg = json.load(f)
+
+idx = 0
+for ob in cfg.get("outbounds", []):
+    tag = ob.get("tag", "")
+    if not tag.startswith("proxy-"):
+        continue
+    num = int(tag.split("-")[1])
+    if num < 1 or num > instance_count:
+        continue
+    ip = ips[(num - 1) % ip_count]
+    try:
+        ob["settings"]["vnext"][0]["address"] = ip
+    except (KeyError, IndexError):
+        pass
+    idx += 1
+
+with open(config_file, "w") as f:
+    json.dump(cfg, f, indent=4)
+print(f"Updated {idx} outbounds in {config_file}")
+PYEOF
+    else
+        # Fallback: sed-based replacement using the ordered placeholder IPs
+        echo "python3 not found, using sed fallback"
+        local i=1
+        # Work on a temp copy to avoid partial writes
+        local tmp=\$(mktemp)
+        cp "\$XRAY_CONFIG" "\$tmp"
+        while [ \$i -le "\$INSTANCE_COUNT" ]; do
+            local ip="\${ips[\$(( (i-1) % ip_count ))]}"
+            # Replace address for outbound proxy-\$i (matches the nth address field in its vnext block)
+            sed -i "0,/\"address\": \"[^\"]*\"/!{/\"address\": \"[^\"]*\"/{s/\"address\": \"[^\"]*\"/\"address\": \"\$ip\"/; }}" "\$tmp" 2>/dev/null || true
+            i=\$((i + 1))
+        done
+        mv "\$tmp" "\$XRAY_CONFIG"
+    fi
+
+    # Reload xray — try SIGHUP first (xray supports config reload via SIGHUP), then restart
+    local xray_pid=\$(pgrep -x xray 2>/dev/null | head -1)
+    if [ -n "\$xray_pid" ]; then
+        kill -HUP "\$xray_pid" 2>/dev/null && echo "Sent SIGHUP to xray (pid \$xray_pid)" || true
+    else
+        echo "xray not running yet, config will be picked up on start"
+    fi
+}
+
+echo "=========================================="
+echo "Starting xdns runner"
+echo "Scanner domain: \$SCANNER_DOMAIN"
+echo "Instances: \$INSTANCE_COUNT"
+echo "Config: \$XRAY_CONFIG"
+echo "=========================================="
+
+# Initial scan
+if scan_dns; then
+    apply_dns_to_xray
+else
+    echo "WARNING: Initial scan found no tunnel IPs; xray will use placeholder addresses until next scan"
+fi
+
+# Periodic re-scan every 10 minutes
+SCAN_COUNT=0
+while true; do
+    SCAN_COUNT=\$((SCAN_COUNT + 1))
+    # Full refresh every 20 cycles (~3.3 hours)
+    if [ \$((SCAN_COUNT % 20)) -eq 0 ] && [ -f "\$DNS_FILE" ] && [ -s "\$DNS_FILE" ]; then
+        echo "=== Full DNS refresh (cycle \$SCAN_COUNT) ==="
+        cp "\$DNS_FILE" "\$_DNS_FILE"
+        > "\$DNS_FAILURES_FILE"
+    fi
+    scan_start=\$(date +%s)
+    echo "Periodic DNS scan #\$SCAN_COUNT..."
+    if scan_dns; then
+        apply_dns_to_xray
+    else
+        refill_dns_file
+    fi
+    scan_end=\$(date +%s)
+    elapsed=\$((scan_end - scan_start))
+    sleep_sec=\$((600 - elapsed))
+    [ \$sleep_sec -lt 0 ] && sleep_sec=0
+    echo "Scan done in \${elapsed}s. Next in \${sleep_sec}s."
+    sleep \$sleep_sec
+done
+XDNS_SCRIPT
+
+    chmod +x "$INSTALL_DIR/run_xdns.sh"
+    success "run_xdns.sh written → $INSTALL_DIR/run_xdns.sh"
+}
+
 # ---------------------------------------------------------------------------
 # Step 10 — Auto-start service (optional)
 # ---------------------------------------------------------------------------
@@ -2187,6 +2481,7 @@ install_service() {
         case "${TUNNEL_MODE:-1}" in
             2) runner_script="$INSTALL_DIR/run_slipstream.sh" ;;
             3) runner_script="$INSTALL_DIR/run_both.sh" ;;
+            4) runner_script="$INSTALL_DIR/run_xdns.sh" ;;
             *) runner_script="$INSTALL_DIR/run_dnstt.sh" ;;
         esac
 
@@ -2250,6 +2545,7 @@ EOF
         case "${TUNNEL_MODE:-1}" in
             2) runner_script_mac="$INSTALL_DIR/run_slipstream.sh" ;;
             3) runner_script_mac="$INSTALL_DIR/run_both.sh" ;;
+            4) runner_script_mac="$INSTALL_DIR/run_xdns.sh" ;;
             *) runner_script_mac="$INSTALL_DIR/run_dnstt.sh" ;;
         esac
 
@@ -2328,7 +2624,16 @@ print_summary() {
     echo ""
     echo -e "  Install dir  : ${CYAN}$INSTALL_DIR${NC}"
     echo -e "  DNS file     : dns.txt (${DNS_COUNT:-?} entries)"
-    echo -e "  Tunnel mode  : $([ "${TUNNEL_MODE:-1}" = "1" ] && echo "dnstt only" || ([ "${TUNNEL_MODE}" = "2" ] && echo "slipstream-rust only" || echo "Both (dnstt + slipstream-rust)"))"
+
+    local tunnel_label
+    case "${TUNNEL_MODE:-1}" in
+        1) tunnel_label="dnstt only" ;;
+        2) tunnel_label="slipstream-rust only" ;;
+        3) tunnel_label="Both (dnstt + slipstream-rust)" ;;
+        4) tunnel_label="xdns (xray direct)" ;;
+        *) tunnel_label="dnstt only" ;;
+    esac
+    echo -e "  Tunnel mode  : $tunnel_label"
 
     case "${TUNNEL_MODE:-1}" in
         1)
@@ -2359,8 +2664,20 @@ print_summary() {
             echo -e "  slip domain  : $SLIP_DOMAIN"
             echo -e "  slip inst.   : $SLIP_INSTANCE_COUNT (ports $SLIP_START_PORT–$SLIP_END_PORT)"
             ;;
+        4)
+            echo -e "  Binaries     : xray, dnstt-dns-scanner"
+            echo -e "  xdns UUID    : $XDNS_UUID"
+            echo -e "  xdns domain  : $XDNS_DOMAIN"
+            echo -e "  xdns inst.   : $XDNS_INSTANCE_COUNT outbounds"
+            echo -e "  scan domain  : $DNSTT_DOMAIN"
+            echo -e "  scan pubkey  : ${DNSTT_PUBKEY:0:16}..."
+            ;;
     esac
-    echo -e "  Total inst.  : $INSTANCE_COUNT (ports $START_PORT–$END_PORT)"
+    if [ "${TUNNEL_MODE:-1}" = "4" ]; then
+        echo -e "  Total inst.  : $INSTANCE_COUNT xdns outbound(s)"
+    else
+        echo -e "  Total inst.  : $INSTANCE_COUNT (ports $START_PORT–$END_PORT)"
+    fi
 
     if [ "${USE_VLESS:-0}" -eq 1 ]; then
         echo -e "  VLESS port   : $VLESS_PORT"
@@ -2371,34 +2688,53 @@ print_summary() {
     fi
     echo ""
     echo -e "  ${YELLOW}How it works:${NC}"
-    echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes."
     case "${TUNNEL_MODE:-1}" in
         1)
+            echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes."
             echo -e "    2. Servers with working DNSTT tunnels are ranked and saved to ${CYAN}dns_with_tunnels.txt${NC}."
             echo -e "    3. ${CYAN}run_dnstt.sh${NC} distributes the best DNS servers across $INSTANCE_COUNT dnstt-client instances."
+            echo -e "    4. ${CYAN}xray${NC} load-balances your traffic across all live tunnels (strategy: ${XRAY_STRATEGY:-leastPing})."
             ;;
         2)
+            echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes."
             echo -e "    2. Reachable DNS servers are ranked by latency and saved to ${CYAN}slip_dns_with_tunnels.txt${NC}."
             echo -e "    3. ${CYAN}run_slipstream.sh${NC} distributes DNS servers across $INSTANCE_COUNT slipstream-client instances."
+            echo -e "    4. ${CYAN}xray${NC} load-balances your traffic across all live tunnels (strategy: ${XRAY_STRATEGY:-leastPing})."
             ;;
         3)
+            echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes."
             echo -e "    2. DNSTT-capable servers → ${CYAN}dns_with_tunnels.txt${NC}; reachable servers → ${CYAN}slip_dns_with_tunnels.txt${NC}."
             echo -e "    3. ${CYAN}run_both.sh${NC} launches both dnstt ($DNSTT_INSTANCE_COUNT inst.) and slipstream ($SLIP_INSTANCE_COUNT inst.) runners."
+            echo -e "    4. ${CYAN}xray${NC} load-balances your traffic across all live tunnels (strategy: ${XRAY_STRATEGY:-leastPing})."
+            ;;
+        4)
+            echo -e "    1. ${CYAN}dnstt-dns-scanner${NC} scans all DNS servers in ${CYAN}_dns.txt${NC} every 10 minutes."
+            echo -e "    2. Working DNS IPs are saved to ${CYAN}xdns_dns_with_tunnels.txt${NC}."
+            echo -e "    3. ${CYAN}run_xdns.sh${NC} distributes IPs across $INSTANCE_COUNT VLESS+KCP+xdns outbounds and reloads xray."
+            echo -e "    4. ${CYAN}xray${NC} routes traffic through the live outbounds (strategy: ${XRAY_STRATEGY:-leastPing})."
             ;;
     esac
-    echo -e "    4. ${CYAN}xray${NC} load-balances your traffic across all live tunnels (strategy: ${XRAY_STRATEGY:-leastPing})."
     echo ""
+
     echo -e "  ${YELLOW}For now, please wait for the scanner to finish its first scan.${NC}"
+    echo ""
 
     local main_runner_script
     case "${TUNNEL_MODE:-1}" in
         2) main_runner_script="run_slipstream.sh" ;;
         3) main_runner_script="run_both.sh" ;;
+        4) main_runner_script="run_xdns.sh" ;;
         *) main_runner_script="run_dnstt.sh" ;;
     esac
 
+    local runner_log
+    case "${TUNNEL_MODE:-1}" in
+        4) runner_log="logs/xdns-runner.log" ;;
+        *) runner_log="logs/dnstt-runner.log" ;;
+    esac
+
     echo -e "  You can watch progress with:"
-    echo -e "    tail -f ${CYAN}$INSTALL_DIR/logs/dnstt-runner.log${NC}"
+    echo -e "    tail -f ${CYAN}$INSTALL_DIR/$runner_log${NC}"
     echo ""
     echo -e "  To start manually:"
     echo -e "    cd ${CYAN}$INSTALL_DIR${NC}"
@@ -2408,15 +2744,21 @@ print_summary() {
 
     if [ "${SERVICES_STARTED:-0}" -eq 1 ]; then
         echo -e "  Service commands:"
-        echo -e "    systemctl status dnstt-runner       # check dnstt-runner status"
+        echo -e "    systemctl status dnstt-runner       # check runner status"
+        echo -e "    journalctl -u dnstt-runner -f       # follow runner logs"
+        echo -e "    systemctl restart dnstt-runner      # restart runner"
         echo -e "    systemctl status xray-dnstt         # check xray status"
-        echo -e "    journalctl -u dnstt-runner -f       # follow dnstt-runner logs"
         echo -e "    journalctl -u xray-dnstt -f         # follow xray logs"
-        echo -e "    systemctl restart dnstt-runner      # restart dnstt-runner"
         echo -e "    systemctl restart xray-dnstt        # restart xray"
         echo ""
+        local tunnels_file
+        case "${TUNNEL_MODE:-1}" in
+            2) tunnels_file="slip_dns_with_tunnels.txt" ;;
+            4) tunnels_file="xdns_dns_with_tunnels.txt" ;;
+            *) tunnels_file="dns_with_tunnels.txt" ;;
+        esac
         echo -e "  Once the scanner finishes, check tunnel IPs:"
-        echo -e "    cat ${CYAN}$INSTALL_DIR/dns_with_tunnels.txt${NC}"
+        echo -e "    cat ${CYAN}$INSTALL_DIR/$tunnels_file${NC}"
         echo ""
     fi
 }
@@ -2439,10 +2781,13 @@ get_our_ports() {
     our_ports=""
     [ "${USE_VLESS:-0}" -eq 1 ] && our_ports="${our_ports} ${VLESS_PORT:-}"
     [ "${USE_MIXED:-0}" -eq 1 ] && our_ports="${our_ports} ${MIXED_PORT:-}"
-    local p
-    for p in $(seq "${START_PORT:-7001}" "${END_PORT:-7001}"); do
-        our_ports="${our_ports} ${p}"
-    done
+    # xdns mode has no local SOCKS tunnel ports
+    if [ "${TUNNEL_MODE:-1}" != "4" ]; then
+        local p
+        for p in $(seq "${START_PORT:-7001}" "${END_PORT:-7001}"); do
+            our_ports="${our_ports} ${p}"
+        done
+    fi
     echo "$our_ports"
 }
 
@@ -2471,6 +2816,7 @@ stop_running_instances_if_our_ports_in_use() {
     pkill -f "run_dnstt.sh"      2>/dev/null || true
     pkill -f "run_slipstream.sh" 2>/dev/null || true
     pkill -f "run_both.sh"       2>/dev/null || true
+    pkill -f "run_xdns.sh"       2>/dev/null || true
     sleep 1
     pkill -f "dnstt-client"      2>/dev/null || true
     pkill -f "slipstream-client" 2>/dev/null || true
@@ -2485,7 +2831,7 @@ stop_running_instances_if_our_ports_in_use() {
 uninstall() {
     echo ""
     echo -e "${RED}============================================================${NC}"
-    echo -e "${RED}  dnstt / slipstream-rust + dnstt-dns-scanner + xray Uninstaller${NC}"
+    echo -e "${RED}  dnstt / slipstream-rust / xdns + xray Uninstaller${NC}"
     echo -e "${RED}============================================================${NC}"
     echo ""
 
@@ -2503,7 +2849,7 @@ uninstall() {
     warn "This will:"
     echo "  - Stop all running dnstt-client, slipstream-client, xray, and runner processes"
     echo "  - Remove systemd/launchd services (if installed)"
-    echo "  - Remove runner-created data: logs/, dns_* and slip_* files (tools kept)"
+    echo "  - Remove runner-created data: logs/, dns_*, slip_*, xdns_* files (tools kept)"
     echo ""
     echo -e "${CYAN}Also remove all tools and the install directory? [y/N]:${NC} \c"
     read -r remove_tools
@@ -2519,6 +2865,7 @@ uninstall() {
     pkill -f "run_dnstt.sh"      2>/dev/null || true
     pkill -f "run_slipstream.sh" 2>/dev/null || true
     pkill -f "run_both.sh"       2>/dev/null || true
+    pkill -f "run_xdns.sh"       2>/dev/null || true
     sleep 1
     pkill -f "dnstt-client"      2>/dev/null || true
     pkill -f "slipstream-client" 2>/dev/null || true
@@ -2548,12 +2895,12 @@ uninstall() {
         fi
     done
 
-    # Remove runner-created data (logs, dns_* and slip_* files)
+    # Remove runner-created data (logs, dns_*, slip_*, xdns_* files)
     if [ -d "$uninstall_dir/logs" ]; then
         info "Removing logs directory"
         rm -rf "$uninstall_dir/logs"
     fi
-    for f in "$uninstall_dir"/dns_* "$uninstall_dir"/slip_*; do
+    for f in "$uninstall_dir"/dns_* "$uninstall_dir"/slip_* "$uninstall_dir"/xdns_*; do
         [ -e "$f" ] || continue
         info "Removing $f"
         rm -f "$f"
@@ -2581,7 +2928,7 @@ uninstall() {
 # ---------------------------------------------------------------------------
 echo ""
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}  dnstt / slipstream-rust + dnstt-dns-scanner + xray Installer${NC}"
+echo -e "${GREEN}  dnstt / slipstream-rust / xdns + xray Installer${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo "  1) Install"
@@ -2599,6 +2946,7 @@ ask_install_dir
 check_deps
 ask_tunnel_mode
 download_tools
+
 ask_resolvers
 
 # Ask settings based on tunnel mode
@@ -2617,6 +2965,9 @@ case "${TUNNEL_MODE:-1}" in
     3)
         ask_dnstt_settings
         ask_slipstream_settings
+        ;;
+    4)
+        ask_xdns_settings
         ;;
 esac
 
